@@ -4,15 +4,15 @@ ARG BASE_IMAGE=python:3.12-slim-bookworm
 FROM ${BASE_IMAGE}
 
 # BUILD_REGION switches apt/PyPI sources:
-#   global  -> use Debian/PyPI official directly, skip Aliyun entirely (default)
-#   cn      -> Aliyun mirrors first, fall back to official on failure
+#   global  -> use Debian/PyPI official directly, skip China mirrors (default)
+#   cn      -> Tsinghua mirrors first, fall back to official on failure
 ARG BUILD_REGION=global
 ARG APP_VERSION=""
 ARG GIT_TAG=""
 
 WORKDIR /app
 
-# Apt: when BUILD_REGION=cn, try Aliyun Debian mirror first (typical win in mainland) and
+# Apt: when BUILD_REGION=cn, try Tsinghua Debian mirror first (typical win in mainland) and
 # restore official on failure. Otherwise go straight to official sources so overseas
 # builders (e.g. GitHub-hosted runners) don't waste time hitting cn mirrors.
 RUN set -eux; \
@@ -21,7 +21,7 @@ RUN set -eux; \
       if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         cp /etc/apt/sources.list.d/debian.sources /tmp/debian.sources.bak; \
         sed -i -E \
-          's|https?://deb.debian.org|https://mirrors.aliyun.com|g; s|https?://security.debian.org|https://mirrors.aliyun.com|g' \
+          's|https?://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|https?://security.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' \
           /etc/apt/sources.list.d/debian.sources; \
         if ! apt-get -o "$APT_TIMEOUT" -o Acquire::https::Timeout=35 update; then \
           cp /tmp/debian.sources.bak /etc/apt/sources.list.d/debian.sources; \
