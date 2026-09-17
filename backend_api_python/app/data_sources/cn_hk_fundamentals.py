@@ -27,6 +27,7 @@ from app.data_sources.asia_stock_kline import (
     ak_a_code_from_tencent,
     ak_hk_code_from_tencent,
 )
+from app.data_sources.tencent import fetch_quote
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -379,7 +380,35 @@ def _eastmoney_a_em_symbol(tencent_code: str) -> str:
     c = (c or "").zfill(6)
     if c.startswith("6"):
         return "SH" + c
+    if c.startswith(("4", "8", "92")):
+        return "BJ" + c
     return "SZ" + c
+
+
+def _apply_tencent_valuation_fallback(result: Dict[str, Any], tencent_code: str) -> None:
+    """Fill valuation fields from Tencent when Eastmoney/Yahoo are unavailable."""
+    if all(result.get(key) is not None for key in ("pe_ratio", "pb_ratio", "market_cap")):
+        return
+    try:
+        parts = fetch_quote(tencent_code)
+    except Exception as exc:
+        logger.debug("Tencent fundamental fallback failed %s: %s", tencent_code, exc)
+        return
+    if not parts or len(parts) <= 46:
+        return
+
+    pe = _float_clean(parts[39])
+    float_market_cap_yi = _float_clean(parts[44])
+    market_cap_yi = _float_clean(parts[45])
+    pb = _float_clean(parts[46])
+    if result.get("pe_ratio") is None and pe is not None:
+        result["pe_ratio"] = pe
+    if result.get("pb_ratio") is None and pb is not None:
+        result["pb_ratio"] = pb
+    if result.get("float_market_cap") is None and float_market_cap_yi is not None:
+        result["float_market_cap"] = float_market_cap_yi * 100_000_000
+    if result.get("market_cap") is None and market_cap_yi is not None:
+        result["market_cap"] = market_cap_yi * 100_000_000
 
 
 def _individual_info_map(symbol_6: str) -> Dict[str, Any]:
@@ -446,6 +475,7 @@ def fetch_cn_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
             if peg is not None:
                 result["peg"] = peg
 
+    _apply_tencent_valuation_fallback(result, tencent_code)
     return result
 
 

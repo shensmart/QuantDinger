@@ -107,9 +107,15 @@ def normalize_chart_timeframe(timeframe: str) -> str:
 
 def ak_a_code_from_tencent(tencent_code: str) -> str:
     c = (tencent_code or "").strip().lower()
-    if len(c) >= 8 and c[:2] in ("sh", "sz"):
+    if len(c) >= 8 and c[:2] in ("sh", "sz", "bj"):
         return c[2:]
     return c
+
+
+def _is_bse_tencent_code(tencent_code: str) -> bool:
+    c = (tencent_code or "").strip().upper()
+    digits = c[2:] if c.startswith(("SH", "SZ", "BJ")) else c
+    return digits.isdigit() and len(digits) == 6 and digits.startswith(("4", "8", "92"))
 
 
 def ak_hk_code_from_tencent(tencent_code: str) -> str:
@@ -198,7 +204,9 @@ def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
         if num.isdigit():
             num = str(int(num)).zfill(4)
         return num, "HKEX"
-    digits = c.lstrip("SHSZ")
+    digits = c[2:] if c.startswith(("SH", "SZ", "BJ")) else c
+    if c.startswith("BJ") or digits.startswith(("4", "8", "92")):
+        return digits, "BSE"
     if c.startswith("SH") or digits.startswith("6"):
         return digits, "SSE"
     return digits, "SZSE"
@@ -337,7 +345,9 @@ def yf_symbol_from_tencent(tencent_code: str, is_hk: bool) -> str:
         return c[2:] + ".SS"
     if c.startswith("SZ"):
         return c[2:] + ".SZ"
-    digits = c.lstrip("SHSZ")
+    digits = c[2:] if c.startswith(("SH", "SZ", "BJ")) else c
+    if c.startswith("BJ") or digits.startswith(("4", "8", "92")):
+        return digits + ".BJ"
     if digits.startswith("6"):
         return digits + ".SS"
     return digits + ".SZ"
@@ -434,6 +444,9 @@ def fetch_yfinance_klines(
         import yfinance as yf
     except ImportError:
         logger.debug("yfinance not installed; skipping yfinance K-lines")
+        return []
+    if not is_hk and _is_bse_tencent_code(tencent_code):
+        logger.debug("Yahoo Finance does not support Beijing Stock Exchange; skipping %s", tencent_code)
         return []
 
     interval = _YF_INTERVAL_MAP.get(timeframe)

@@ -24,10 +24,12 @@ logger = get_logger(__name__)
 
 def normalize_cn_code(symbol: str) -> str:
     """
-    Normalize A-share symbol to Tencent code: sh600519 / sz000001.
+    Normalize A-share symbol to Tencent code: sh600519 / sz000001 / bj920992.
     Accepts:
     - 600519 / 600519.SH / 600519.SS
     - 000001 / 000001.SZ
+    - 920992 / 920992.BJ / BJ920992
+    - legacy Beijing Stock Exchange codes beginning with 4 or 8
     """
     s = (symbol or "").strip().upper()
     if not s:
@@ -41,9 +43,18 @@ def normalize_cn_code(symbol: str) -> str:
     if s.endswith(".SZ"):
         s = s[:-3]
         return f"SZ{s}"
+    if s.endswith(".BJ"):
+        s = s[:-3]
+        return f"BJ{s}"
+    if s.startswith(("SH", "SZ", "BJ")) and len(s) == 8 and s[2:].isdigit():
+        return s
 
     if s.isdigit() and len(s) == 6:
-        return ("SH" + s) if s.startswith("6") else ("SZ" + s)
+        if s.startswith("6"):
+            return "SH" + s
+        if s.startswith(("4", "8", "92")):
+            return "BJ" + s
+        return "SZ" + s
 
     return s
 
@@ -239,4 +250,3 @@ def fetch_kline(code: str, period: str, count: int = 300, adj: str = "qfq", time
         if isinstance(v, list) and v and str(k).lower().endswith(str(period).lower()):
             return v
     return []
-
