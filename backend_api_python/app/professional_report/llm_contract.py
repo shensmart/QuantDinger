@@ -2,11 +2,54 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .narrative import normalize_report_text
+
+
+_EVIDENCE_ID_IN_TEXT = re.compile(r"(?<![A-Za-z0-9])ev_[A-Za-z0-9]+")
+_MISLABELED_TECHNICAL_INCONSISTENCY_ZH = re.compile(
+    r"(技术面(?:内部)?不一致|技术指标(?:内部)?不一致)"
+)
+_MISLABELED_TECHNICAL_INCONSISTENCY_EN = re.compile(
+    r"(?:technical(?:\s+analysis)?\s+(?:is\s+)?internally\s+inconsistent"
+    r"|technical\s+indicators?\s+(?:are\s+)?internally\s+inconsistent)",
+    re.IGNORECASE,
+)
+
+
+def _clean_visible_narrative(value: Any) -> tuple[Any, bool]:
+    """Remove audit-only evidence IDs and correct a common mixed-signal mislabel."""
+    if isinstance(value, str):
+        cleaned = _MISLABELED_TECHNICAL_INCONSISTENCY_ZH.sub("技术面信号混合", value)
+        cleaned = _MISLABELED_TECHNICAL_INCONSISTENCY_EN.sub("mixed technical picture", cleaned)
+        cleaned = _EVIDENCE_ID_IN_TEXT.sub("", cleaned)
+        cleaned = re.sub(r"\(\s*[、,，;；:：\s]*\)", "", cleaned)
+        cleaned = re.sub(r"[\s、,，;；:：]+([)）])", r"\1", cleaned)
+        cleaned = re.sub(r"[\s、,，;；:：]+([。.!?！？])", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([,，。；;.!?])", r"\1", cleaned).strip()
+        return cleaned, cleaned != value
+    if isinstance(value, list):
+        changed = False
+        cleaned_items = []
+        for item in value:
+            cleaned, item_changed = _clean_visible_narrative(item)
+            cleaned_items.append(cleaned)
+            changed = changed or item_changed
+        return cleaned_items, changed
+    if isinstance(value, dict):
+        changed = False
+        cleaned_items = {}
+        for key, item in value.items():
+            cleaned, item_changed = _clean_visible_narrative(item)
+            cleaned_items[key] = cleaned
+            changed = changed or item_changed
+        return cleaned_items, changed
+    return value, False
 
 
 class AnalysisSections(BaseModel):
@@ -81,6 +124,18 @@ def validate_llm_analysis(
         valid = False
 
     result = model.model_dump(mode="json")
+    for key in ("summary", "analysis", "key_reasons", "risks"):
+        cleaned, changed = _clean_visible_narrative(result.get(key))
+        result[key] = cleaned
+        if changed:
+            warnings.append(f"visible_evidence_metadata_cleaned:{key}")
+    cleaned_claims = []
+    for index, claim in enumerate(result["evidence_claims"]):
+        claim_text, changed = _clean_visible_narrative(claim.get("text"))
+        if changed:
+            warnings.append(f"visible_evidence_metadata_cleaned:evidence_claims.{index}.text")
+        cleaned_claims.append({**claim, "text": claim_text})
+    result["evidence_claims"] = cleaned_claims
     known = known_evidence_ids or set()
     if known:
         filtered_claims = []
