@@ -5,8 +5,10 @@ Runs scheduled AI analysis on manual positions and sends notifications.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -466,6 +468,100 @@ def _build_comprehensive_report(
     return _build_html_report(positions, position_analyses, language, custom_prompt)
 
 
+_REPORT_SENTENCE_SPLIT = re.compile(
+    r'(?<=[。！？!?；;])\s*|(?<=[.!?])\s+(?=[A-Z0-9])'
+)
+_REPORT_LIST_ITEM = re.compile(r'^\s*(?:[-*•]|\d+[.)、])\s*(.+?)\s*$')
+_REPORT_EVIDENCE_ID = re.compile(r'(?<![A-Za-z0-9])ev_[A-Za-z0-9]+')
+_REPORT_TECHNICAL_INCONSISTENCY_ZH = re.compile(
+    r'(技术面(?:内部)?不一致|技术指标(?:内部)?不一致)'
+)
+_REPORT_TECHNICAL_INCONSISTENCY_EN = re.compile(
+    r'(?:technical(?:\s+analysis)?\s+(?:is\s+)?internally\s+inconsistent'
+    r'|technical\s+indicators?\s+(?:are\s+)?internally\s+inconsistent)',
+    re.IGNORECASE,
+)
+
+
+def _clean_report_copy(text: Any) -> str:
+    """Hide audit-only evidence IDs from legacy and newly generated reports."""
+    cleaned = _REPORT_TECHNICAL_INCONSISTENCY_ZH.sub('技术面信号混合', str(text or ''))
+    cleaned = _REPORT_TECHNICAL_INCONSISTENCY_EN.sub('mixed technical picture', cleaned)
+    cleaned = _REPORT_EVIDENCE_ID.sub('', cleaned)
+    cleaned = re.sub(r'\(\s*[、,，;；:：\s]*\)', '', cleaned)
+    cleaned = re.sub(r'[\s、,，;；:：]+([)）])', r'\1', cleaned)
+    cleaned = re.sub(r'[\s、,，;；:：]+([。.!?！？])', r'\1', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    return re.sub(r'\s+([,，。；;.!?])', r'\1', cleaned).strip()
+
+
+def _join_report_sentences(first: str, second: str) -> str:
+    if first and second and first[-1] in '.!?' and second[0].isascii() and second[0].isalnum():
+        return f"{first} {second}"
+    return f"{first}{second}"
+
+
+def _format_report_prose(text: Any) -> str:
+    """Render plain report text as readable paragraphs without changing its meaning."""
+    raw = _clean_report_copy(text).replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not raw:
+        return ''
+
+    source_paragraphs = [part.strip() for part in re.split(r'\n\s*\n', raw) if part.strip()]
+    output: List[str] = []
+    for source in source_paragraphs:
+        source = re.sub(r'\s*\n\s*', ' ', source)
+        source = re.sub(r'[ \t]+', ' ', source).strip()
+        if not source:
+            continue
+
+        sentences = [part.strip() for part in _REPORT_SENTENCE_SPLIT.split(source) if part.strip()]
+        if len(sentences) <= 1:
+            output.append(f'<p>{html.escape(source)}</p>')
+            continue
+
+        grouped: List[str] = []
+        grouped_sentence_counts: List[int] = []
+        for sentence in sentences:
+            if (
+                grouped
+                and grouped_sentence_counts[-1] < 2
+                and len(grouped[-1]) + len(sentence) <= 180
+            ):
+                grouped[-1] = _join_report_sentences(grouped[-1], sentence)
+                grouped_sentence_counts[-1] += 1
+            else:
+                grouped.append(sentence)
+                grouped_sentence_counts.append(1)
+        output.extend(f'<p>{html.escape(paragraph)}</p>' for paragraph in grouped)
+
+    return ''.join(output)
+
+
+def _format_report_list(text: Any) -> str:
+    """Render bullet/numbered report text as a list, falling back to prose."""
+    raw = _clean_report_copy(text).replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not raw:
+        return ''
+
+    items: List[str] = []
+    for line in raw.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        match = _REPORT_LIST_ITEM.match(line)
+        if not match:
+            return _format_report_prose(raw)
+        items.append(match.group(1))
+
+    if not items:
+        return ''
+    return '<div class="qd-copy-list" role="list">' + ''.join(
+        f'<div class="qd-copy-list-item" role="listitem">- {html.escape(item)}</div>'
+        for item in items
+    ) + '</div>'
+
+
 def _build_html_report(
     positions: List[Dict[str, Any]],
     position_analyses: List[Dict[str, Any]],
@@ -568,6 +664,11 @@ def _build_html_report(
         .qd-pos-reasoning { padding: 14px 16px; background: #f8fafc; border-top: 1px solid #e7ebf3; }
         .qd-pos-reasoning .label { color: #111827; font-size: 12px; font-weight: 800; margin-bottom: 6px; }
         .qd-pos-reasoning .text { color: #334155; font-size: 13px; line-height: 1.7; }
+        .qd-copy p { margin: 0 0 10px; text-indent: 2em; }
+        .qd-copy p:last-child { margin-bottom: 0; }
+        .qd-copy-list { margin: 0; padding-left: 0; }
+        .qd-copy-list-item { margin: 0 0 8px; }
+        .qd-copy-list-item:last-child { margin-bottom: 0; }
         .qd-collapsible { border-top: 1px solid #e7ebf3; }
         .qd-collapsible input[type="checkbox"] { display: none; }
         .qd-collapsible-header { display: flex; justify-content: space-between; align-items: center; padding: 11px 16px; background: #f1f5f9; cursor: pointer; user-select: none; }
@@ -811,7 +912,7 @@ def _build_html_report(
             html += f'''
                     <div class="qd-pos-reasoning">
                         <div class="label">{texts['reasoning']}</div>
-                        <div class="text">{reasoning[:500]}{'...' if len(reasoning) > 500 else ''}</div>
+                        <div class="text qd-copy">{_format_report_prose(reasoning[:500] + ('...' if len(reasoning) > 500 else ''))}</div>
                     </div>
             '''
         
@@ -831,7 +932,7 @@ def _build_html_report(
                             <span class="title">{texts['trader_report']}</span>
                             <span class="arrow">-&gt;</span>
                         </label>
-                        <div class="qd-collapsible-content">{trader_reasoning.replace(chr(10), '<br>')}</div>
+                        <div class="qd-collapsible-content qd-copy">{_format_report_prose(trader_reasoning)}</div>
                     </div>
             '''
         
@@ -845,7 +946,7 @@ def _build_html_report(
                             <span class="title">{texts['overview_report']}</span>
                             <span class="arrow">-&gt;</span>
                         </label>
-                        <div class="qd-collapsible-content">{overview_report.replace(chr(10), '<br>')}</div>
+                        <div class="qd-collapsible-content qd-copy">{_format_report_prose(overview_report)}</div>
                     </div>
             '''
         
@@ -859,7 +960,7 @@ def _build_html_report(
                             <span class="title">{texts['risk_report']}</span>
                             <span class="arrow">-&gt;</span>
                         </label>
-                        <div class="qd-collapsible-content">{risk_report.replace(chr(10), '<br>')}</div>
+                        <div class="qd-collapsible-content qd-copy">{_format_report_list(risk_report)}</div>
                     </div>
             '''
         

@@ -10,6 +10,7 @@ import json
 import math
 import re
 import requests
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from time import perf_counter
@@ -264,6 +265,176 @@ def _detect_intent(message: str, has_image: bool) -> str:
     if any(k in text for k in ("交易计划", "trade plan", "trading plan", "entry trigger", "stop loss", "take profit")):
         return "market_analysis"
     return "general"
+
+
+def _monitor_setup_action(
+    message: str,
+    history: list[dict],
+    context: dict,
+    intent: str,
+    language: str,
+) -> dict | None:
+    """Return a host-confirmed monitor draft deterministically.
+
+    Streaming replies are Markdown, so the model cannot reliably emit the
+    JSON action contract used by non-streaming chat. This parser only creates a
+    UI action; it never writes a monitor row.
+    """
+    current = str(message or "")
+    current_lower = current.lower()
+    recent = []
+    for item in (history or [])[-10:]:
+        if isinstance(item, dict):
+            content = str(item.get("content") or "")
+            if content:
+                recent.append(content)
+    flow_text = "\n".join([*recent, current])
+    monitor_terms = (
+        "定时", "任务", "监控", "监控任务", "定时分析", "关注条件",
+        "schedule", "scheduled", "monitor", "定时任务", "盤中", "盘中",
+    )
+    recent_monitor_context = any(
+        any(term in str(item.get("content") or "").lower() for term in monitor_terms)
+        for item in (history or [])[-6:]
+        if isinstance(item, dict)
+    )
+    confirmation = bool(re.match(
+        r"^\s*(?:好|可以|确认|確認|创建|創建|执行|執行|按这个|照这个|就这么|"
+        r"ok|yes|create|confirm|go ahead|proceed)\s*[。.!！]?\s*$",
+        current,
+        re.I,
+    ))
+    explicit_monitor = (
+        intent == "monitor_setup"
+        or any(term in current_lower for term in monitor_terms)
+        or "create_monitor_task" in current_lower
+        or (confirmation and recent_monitor_context)
+    )
+    if not explicit_monitor:
+        return None
+
+    target_market = ""
+    target_symbol = ""
+    target_text = current
+
+    market_match = re.search(
+        r"(?:market|市场|市場)\s*[:：=]?\s*(CNStock|USStock|Crypto|Forex|HKStock)",
+        flow_text,
+        re.I,
+    )
+    if market_match:
+        target_market = market_match.group(1)
+
+    target_match = re.search(
+        r"(?:target|标的|代码|代碼|symbol|ticker|code)\s*[:：=]?\s*"
+        r"(?:([A-Za-z]+)\s*[:：/]\s*)?"
+        r"([A-Za-z0-9][A-Za-z0-9._-]{1,24})",
+        target_text,
+        re.I,
+    )
+    if target_match:
+        target_market = target_match.group(1) or target_market
+        target_symbol = target_match.group(2)
+    if not target_symbol:
+        bare_code = re.search(r"(?<!\d)(\d{6})(?!\d)", current)
+        if bare_code:
+            target_symbol = bare_code.group(1)
+        else:
+            pair = re.search(r"(?<![A-Za-z0-9])([A-Za-z]{2,10}/[A-Za-z0-9]{2,10})(?![A-Za-z0-9])", flow_text)
+            if pair:
+                target_symbol = pair.group(1)
+
+    if not target_symbol:
+        target_symbol = str(
+            context.get("symbol")
+            or context.get("resolved_symbol")
+            or context.get("selected_symbol")
+            or ""
+        ).strip()
+    if not target_market:
+        target_market = str(
+            context.get("market")
+            or context.get("resolved_market")
+            or context.get("selected_market")
+            or ""
+        ).strip()
+    if target_symbol and not target_market:
+        if re.fullmatch(r"\d{6}", target_symbol):
+            target_market = "CNStock"
+        elif "/" in target_symbol:
+            target_market = "Crypto"
+        else:
+            target_market = "USStock"
+    if not target_symbol:
+        return None
+
+    interval_minutes = 60
+    explicit_hourly = bool(re.search(r"(?:每|每隔|every)?\s*(?:1\s*)?(?:小时|小時|hour)", flow_text, re.I))
+    explicit_close = bool(re.search(r"(?:收盘|收盤|收盘后|收盤後|market\s*close|close)", flow_text, re.I))
+    interval_match = re.search(
+        r"(?:每|每隔|interval\s*[:：=]?)?\s*(\d+)\s*(分钟|分鐘|min|minute|小时|小時|hour|h|天|day)",
+        flow_text,
+        re.I,
+    )
+    if interval_match:
+        amount = int(interval_match.group(1))
+        unit = interval_match.group(2).lower()
+        if unit in ("小时", "小時", "hour", "h"):
+            interval_minutes = amount * 60
+        elif unit in ("天", "day"):
+            interval_minutes = amount * 1440
+        else:
+            interval_minutes = amount
+    elif explicit_hourly:
+        interval_minutes = 60
+    elif re.search(r"(?:每天|每日|daily)", flow_text, re.I):
+        interval_minutes = 1440
+    interval_minutes = max(5, min(interval_minutes, 60 * 24 * 7))
+
+    channels: list[str] = []
+    if re.search(r"(?:浏览器|瀏覽器|browser|站内|站內)", flow_text, re.I):
+        channels.append("browser")
+    if re.search(r"(?:邮件|郵件|email|e-mail)", flow_text, re.I):
+        channels.append("email")
+    if re.search(r"(?:telegram|\btg\b)", flow_text, re.I):
+        channels.append("telegram")
+    if re.search(r"(?:webhook|回调|回調|飞书|飛書|钉钉|釘釘|企业微信|企業微信)", flow_text, re.I):
+        channels.append("webhook")
+
+    focus_conditions = ""
+    focus_match = re.search(
+        r"(?:focus_conditions|关注条件|關注條件|关注点|關注點)\s*[:：=]\s*([^\n]+)",
+        flow_text,
+        re.I,
+    )
+    if focus_match:
+        focus_conditions = focus_match.group(1).strip()
+
+    time_note = ""
+    if explicit_close and explicit_hourly:
+        time_note = " 当前调度模型仅支持一个间隔；卡片使用盘中每 60 分钟，收盘后分析请另行增加一个 1440 分钟任务。"
+    elif explicit_close:
+        time_note = " 当前调度模型使用 1440 分钟间隔。"
+
+    label = "创建定时分析" if str(language or "").lower().startswith("zh") else "Create scheduled analysis"
+    return {
+        "key": f"create-monitor-{target_market.lower()}-{target_symbol.lower()}",
+        "type": "create_monitor_task",
+        "icon": "clock-circle",
+        "label": label,
+        "payload": {
+            "target": {"market": target_market, "symbol": target_symbol.upper()},
+            "interval_min": interval_minutes,
+            "notify_channels": list(dict.fromkeys(channels)),
+            "focus_conditions": focus_conditions,
+            "name": f"AI-{target_symbol.upper()}-{interval_minutes}m",
+            "note": (
+                "生成的待确认任务草稿；点击确认后才创建。"
+                if str(language or "").lower().startswith("zh")
+                else "Pending task draft; the monitor is created only after confirmation."
+            ) + time_note,
+        },
+    }
 
 
 def _fallback_agent_intent(
@@ -1031,6 +1202,8 @@ def _extract_symbol_terms(message: str) -> list[str]:
         token = match.group(1).upper()
         if token not in {"AI", "API", "LLM", "USD", "USDT", "ETF", "IPO", "CEO", "CPI", "GDP", "FOMC"}:
             terms.append(token)
+    for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", text):
+        terms.append(match.group(1))
     for match in re.finditer(r"[A-Za-z][A-Za-z0-9\-.]{2,30}", text):
         token = match.group(0).strip()
         if token.lower() not in {"today", "latest", "price", "stock", "market", "news", "analysis"}:
@@ -1178,7 +1351,8 @@ def _requested_symbol_candidates(message: str, limit: int = 6) -> list[dict]:
 
     pair_pattern = re.compile(r"\b([A-Z0-9]{2,12}/[A-Z0-9]{2,12})\b")
     ticker_pattern = re.compile(r"\$?([A-Z]{1,8})(?:\b|[\-\._])")
-    token_patterns = (pair_pattern, ticker_pattern)
+    cn_numeric_pattern = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+    token_patterns = (pair_pattern, ticker_pattern, cn_numeric_pattern)
     pair_spans = [(match.start(1), match.end(1)) for match in pair_pattern.finditer(text)]
     excluded = {"AI", "API", "LLM", "USD", "USDT", "ETF", "IPO", "CEO", "CPI", "GDP", "FOMC"}
     alias_symbols = {str(item[2].get("symbol") or "").upper() for item in positioned}
@@ -1211,7 +1385,10 @@ def _requested_symbol_candidates(message: str, limit: int = 6) -> list[dict]:
                     exact_rows.append(row)
             if not exact_rows:
                 continue
-            market_priority = {"USStock": 0, "HKStock": 1, "CNStock": 2, "Crypto": 3, "Forex": 4, "Futures": 5}
+            if token.isdigit():
+                cn_rows = [row for row in exact_rows if row.get("market") == "CNStock"]
+                exact_rows = cn_rows or exact_rows
+            market_priority = {"CNStock": 0, "USStock": 1, "HKStock": 2, "Crypto": 3, "Forex": 4, "Futures": 5}
             row = sorted(exact_rows, key=lambda item: market_priority.get(str(item.get("market") or ""), 99))[0]
             positioned.append((match.start(1), serial, {
                 "market": row.get("market"),
@@ -1262,38 +1439,175 @@ def _search_intelligence(message: str, candidates: list[dict], language: str) ->
     query_base = (message or "").strip()
     if not query_base:
         return {"web_results": [], "news_results": [], "search_queries": [], "provider_status": []}
-    entity = ""
-    if candidates:
-        entity = candidates[0].get("name") or candidates[0].get("symbol") or candidates[0].get("match") or ""
-    query = f"{entity} {query_base} latest market news".strip() if entity else f"{query_base} latest market news"
-    queries = [query]
-    ticker_query = f"{entity or query_base} stock ticker symbol exchange".strip()
-    if ticker_query not in queries:
-        queries.append(ticker_query)
+    primary = candidates[0] if candidates else {}
+    market = str(primary.get("market") or "").strip()
+    symbol = str(primary.get("symbol") or "").strip()
+    name = str(primary.get("name") or "").strip()
+    subject = " ".join(part for part in (name, symbol) if part).strip()
+    if not subject and candidates:
+        subject = str(primary.get("match") or "").strip()
+
+    if market == "CNStock" and subject:
+        queries = [
+            f"{subject} 最新公告",
+            f"{subject} 新闻",
+            f"{subject} 行业 新闻",
+        ]
+    elif subject:
+        queries = [
+            f"{subject} latest news",
+            f"{subject} earnings news",
+            f"{subject} stock news",
+        ]
+    else:
+        terms = _extract_symbol_terms(query_base)
+        compact = " ".join(terms[:4]) if terms else re.sub(r"\s+", " ", query_base)[:48]
+        queries = [f"{compact} 最新 新闻".strip()]
+    queries = list(dict.fromkeys(query for query in queries if query.strip()))
+    relevance_terms = [term.lower() for term in (name, symbol) if term]
+    if not relevance_terms:
+        relevance_terms = [term.lower() for term in _extract_symbol_terms(query_base)[:4]]
 
     web_results: list[dict] = []
     provider_status: list[dict] = []
+    search_errors: list[str] = []
+
+    if market == "CNStock" and symbol:
+        try:
+            import akshare as ak
+
+            news_frame = ak.stock_news_em(symbol=symbol)
+            for row in news_frame.to_dict("records")[:10]:
+                title = str(row.get("新闻标题") or "").strip()
+                snippet = str(row.get("新闻内容") or "").strip()
+                link = str(row.get("新闻链接") or "").strip()
+                if not title or not link:
+                    continue
+                web_results.append({
+                    "title": title,
+                    "snippet": snippet[:500],
+                    "link": link,
+                    "source": str(row.get("文章来源") or "东方财富").strip(),
+                    "published": str(row.get("发布时间") or "").strip(),
+                    "query": f"{subject} A股新闻",
+                })
+        except Exception as exc:
+            search_errors.append(f"AkShare CNStock news: {exc}")
+
+        try:
+            notice_response = requests.get(
+                "https://np-anotice-stock.eastmoney.com/api/security/ann",
+                params={
+                    "sr": -1,
+                    "page_size": 10,
+                    "page_index": 1,
+                    "ann_type": "A",
+                    "client_source": "web",
+                    "stock_list": symbol,
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            notice_response.raise_for_status()
+            notice_items = (
+                (notice_response.json().get("data") or {}).get("list") or []
+            )
+            for item in notice_items[:10]:
+                title = str(item.get("title") or "").strip()
+                art_code = str(item.get("art_code") or "").strip()
+                notice_date = str(item.get("notice_date") or "").strip()
+                if not title or not art_code:
+                    continue
+                web_results.append({
+                    "title": title,
+                    "snippet": f"{notice_date} 公司公告",
+                    "link": (
+                        "https://data.eastmoney.com/notices/detail/"
+                        f"{symbol}/{art_code}.html"
+                    ),
+                    "source": "东方财富公告",
+                    "published": notice_date,
+                    "query": f"{subject} A股公告",
+                })
+        except Exception as exc:
+            search_errors.append(f"Eastmoney CNStock notices: {exc}")
+
+    service = None
     try:
         service = get_search_service()
         provider_status = service.provider_status() if hasattr(service, "provider_status") else []
-        for q in queries[:3]:
-            for item in service.search(q, num_results=5, days=14):
-                web_results.append({
-                    "title": item.get("title") or "",
-                    "snippet": item.get("snippet") or "",
-                    "link": item.get("link") or item.get("url") or "",
-                    "source": item.get("source") or "",
-                    "published": item.get("published") or "",
-                    "query": q,
-                })
-    except Exception as e:
-        web_results.append({"error": str(e), "query": query})
+    except Exception as exc:
+        search_errors.append(f"Search service unavailable: {exc}")
+
+    # For China A-shares, company news and official announcements above are
+    # first-party structured sources. Use metasearch only when they fail.
+    if not web_results and service is not None:
+        try:
+            for q in queries[:3]:
+                query_items: list[dict] = []
+                last_error: Exception | None = None
+                for attempt in range(2):
+                    try:
+                        query_items = list(service.search(q, num_results=5, days=14))
+                        if query_items:
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                        if attempt == 0:
+                            time.sleep(0.6)
+                if last_error and not query_items:
+                    search_errors.append(f"{q}: {last_error}")
+                for item in query_items:
+                    title = str(item.get("title") or "")
+                    snippet = str(item.get("snippet") or item.get("content") or "")
+                    link = str(item.get("link") or item.get("url") or "")
+                    haystack = f"{title} {snippet} {link}".lower()
+                    if relevance_terms and not any(term in haystack for term in relevance_terms):
+                        continue
+                    web_results.append({
+                        "title": title,
+                        "snippet": snippet,
+                        "link": link,
+                        "source": item.get("source") or "",
+                        "published": item.get("published") or "",
+                        "query": q,
+                    })
+        except Exception as e:
+            search_errors.append(str(e))
+
+    deduped: list[dict] = []
+    seen_results: set[str] = set()
+    for item in web_results:
+        link = re.sub(r"[?#].*$", "", str(item.get("link") or "").strip().lower())
+        title = re.sub(r"\s+", " ", str(item.get("title") or "").strip().lower())
+        key = link or title
+        if not key or key in seen_results:
+            continue
+        seen_results.add(key)
+        deduped.append(item)
+
+    def published_key(item: dict) -> float:
+        raw = str(item.get("published") or "").strip().replace("Z", "+00:00")
+        if not raw:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(raw)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+
+    deduped.sort(key=published_key, reverse=True)
+    if not deduped and search_errors:
+        deduped.append({"error": "; ".join(search_errors[:3]), "query": queries[0] if queries else ""})
 
     return {
-        "web_results": web_results[:8],
-        "news_results": web_results[:5],
+        "web_results": deduped[:8],
+        "news_results": deduped[:5],
         "search_queries": queries,
         "provider_status": provider_status,
+        "search_errors": search_errors,
         "language": language,
     }
 
@@ -2161,15 +2475,27 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
             compact_primary = _compact_market_snapshot(primary_snapshot)
             tool_executions = _research_tool_executions([compact_primary])
 
+    market_data_requested = bool(flags["needs_market_data"])
     plan_snapshots = comparison_snapshots or ([_compact_market_snapshot(primary_snapshot)] if primary_snapshot else [])
-    market_query_status = evaluate_plan_completeness(market_query_plan, plan_snapshots)
+    if market_data_requested:
+        market_query_status = evaluate_plan_completeness(market_query_plan, plan_snapshots)
+    else:
+        market_query_status = {
+            "complete": True,
+            "applicable": False,
+            "reason": "market_data_not_requested",
+            "requested_instruments": len(market_query_plan.get("instruments") or []),
+            "requested_timeframes": list(market_query_plan.get("timeframes") or []),
+            "requested_metrics": list(market_query_plan.get("metrics") or []),
+            "missing": [],
+        }
     tool_executions.insert(0, {
         "tool": "market_query.plan",
         "status": "success",
         "input": {"message": message},
         "output": market_query_plan,
     })
-    if market_query_plan.get("timeframes"):
+    if market_data_requested and market_query_plan.get("timeframes"):
         tool_executions.append({
             "tool": "technical_analysis.compute",
             "status": "success" if market_query_status.get("complete") else "partial",
@@ -3206,8 +3532,20 @@ def chat_message():
 
             actions = parsed.get("actions") or []
             usage_action = _agent_usage_action(agent_plan, context, language)
+            monitor_action = _monitor_setup_action(
+                message,
+                history[:-1],
+                context,
+                intent,
+                language,
+            )
             if usage_action:
                 actions = [usage_action, *actions]
+            if monitor_action and not any(
+                isinstance(action, dict) and action.get("type") == "create_monitor_task"
+                for action in actions
+            ):
+                actions.append(monitor_action)
             assistant_id = _insert_message(
                 cur,
                 session_id=sid,
@@ -3418,6 +3756,16 @@ def chat_message_stream():
                 cur.execute("UPDATE qd_ai_copilot_messages SET intent = ? WHERE id = ? AND user_id = ?", (intent, user_message_id, user_id))
                 _record_research_tool_calls(cur, sid, user_id, context)
                 history = _load_recent_messages(cur, sid, limit=20)
+                monitor_action = _monitor_setup_action(
+                    message,
+                    history[:-1],
+                    context,
+                    intent,
+                    language,
+                )
+                response_actions = [usage_action] if usage_action else []
+                if monitor_action:
+                    response_actions.append(monitor_action)
                 prepared_context, context_meta = _prepare_server_context(
                     cur,
                     user_id=user_id,
@@ -3466,7 +3814,7 @@ def chat_message_stream():
                 "intent": intent,
                 "agent_intent": agent_plan,
                 "agent_usage": usage_action.get("payload") if usage_action else None,
-                "actions": [usage_action] if usage_action else [],
+                "actions": response_actions,
                 "costs": costs,
                 "context_usage": {**context_usage, **context_meta},
             })
@@ -3501,7 +3849,7 @@ def chat_message_stream():
                     content=answer,
                     attachments=[],
                     intent=intent,
-                    actions=[usage_action] if usage_action else [],
+                    actions=response_actions,
                 )
                 if request_usage_id:
                     store_update_request_usage(
@@ -3522,7 +3870,7 @@ def chat_message_stream():
                 "intent": intent,
                 "confidence": 50,
                 "agent_usage": usage_action.get("payload") if usage_action else None,
-                "actions": [usage_action] if usage_action else [],
+                "actions": response_actions,
                 "costs": costs,
                 "memory_candidates": _detect_memory_candidates(message, language),
                 "context_usage": {**context_usage, **context_meta},
