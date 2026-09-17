@@ -194,6 +194,61 @@ def _fetch_sectors_heatmap() -> List[Dict[str, Any]]:
     return _cap_heatmap_rows(sectors)
 
 
+def _fetch_cn_sectors_heatmap() -> List[Dict[str, Any]]:
+    """A-share sector heatmap from the THS industry/concept universes.
+
+    Each sector's move is the equal-weighted average of its members' snapshot
+    change, so it needs no extra endpoint beyond the one the pools already use.
+    """
+    cached = get_cached("heatmap_cn_sectors")
+    if cached:
+        return cached
+    try:
+        from app.data_sources import hithink_finance as hithink
+        from app.services.universe import get_universe_service
+
+        universes = [
+            item
+            for item in get_universe_service().list_universes(0)
+            if item.get("is_system") and str(item.get("code") or "").startswith(("cn_industry_", "cn_concept_"))
+        ]
+        if not universes or not hithink.configured():
+            return []
+        codes: List[str] = []
+        universe_members: Dict[str, List[str]] = {}
+        for universe in universes[:20]:
+            rows = get_universe_service().resolve_members(0, int(universe["id"]))
+            symbols = [str(row.get("symbol") or "") for row in rows if row.get("symbol")]
+            universe_members[str(universe.get("name") or universe.get("code"))] = symbols
+            codes.extend(symbols)
+        quotes = {
+            item.get("symbol"): hithink.snapshot_to_ticker(item)
+            for item in hithink.snapshot(sorted(set(codes))[:800])
+            if item.get("thscode")
+        }
+        rows_out: List[Dict[str, Any]] = []
+        for name, symbols in universe_members.items():
+            changes = [quotes[symbol]["changePercent"] for symbol in symbols if symbol in quotes]
+            if not changes:
+                continue
+            average = sum(changes) / len(changes)
+            rows_out.append({
+                "name": name,
+                "name_cn": name,
+                "name_en": name,
+                "value": round(average, 2),
+                "stocks": symbols[:5],
+            })
+        rows_out.sort(key=lambda item: abs(item["value"]), reverse=True)
+        rows_out = _cap_heatmap_rows(rows_out)
+        if rows_out:
+            set_cached("heatmap_cn_sectors", rows_out, 300)
+        return rows_out
+    except Exception as exc:  # noqa: BLE001 - heatmap must degrade, not fail
+        logger.warning("CN sector heatmap failed: %s", exc)
+        return []
+
+
 def _fetch_indices_heatmap() -> List[Dict[str, Any]]:
     indices_data = get_cached("stock_indices") or []
     rows = []
@@ -220,14 +275,18 @@ def generate_heatmap_data() -> Dict[str, Any]:
         fut_comm = pool.submit(_fetch_commodities_heatmap)
         fut_forex = pool.submit(_fetch_forex_heatmap)
         fut_sectors = pool.submit(_fetch_sectors_heatmap)
+        fut_cn_sectors = pool.submit(_fetch_cn_sectors_heatmap)
         fut_indices = pool.submit(_fetch_indices_heatmap)
 
+        cn_sectors = fut_cn_sectors.result()
         return {
             "us_stocks": fut_us.result(),
             "hk_stocks": fut_hk.result(),
             "crypto": fut_crypto.result(),
             "commodities": fut_comm.result(),
             "forex": fut_forex.result(),
-            "sectors": fut_sectors.result(),
+            # A-share sectors replace the hardcoded US ETF list when available.
+            "sectors": cn_sectors or fut_sectors.result(),
+            "sectors_source": "hithink_cn" if cn_sectors else "us_etf",
             "indices": fut_indices.result(),
         }

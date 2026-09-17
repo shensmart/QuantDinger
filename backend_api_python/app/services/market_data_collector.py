@@ -33,6 +33,23 @@ from app.services.market.technical_indicators import calculate_indicators
 from app.utils.logger import get_logger
 from app.config import APIKeys, FinnhubConfig
 
+
+def _cn_fundamental_primary() -> str:
+    return str(os.getenv("CN_FUNDAMENTAL_PRIMARY_SOURCE") or "hithink").strip().lower()
+
+
+def _num(value: Any) -> Optional[float]:
+    """Best-effort float for provider payloads; None when unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
 logger = get_logger(__name__)
 
 
@@ -574,9 +591,153 @@ class MarketDataCollector:
             logger.warning(f"Fundamental data fetch failed for {market}:{symbol}: {e}")
         return None
 
+    def _hithink_fundamental(self, symbol: str) -> Dict[str, Any]:
+        """A-share fundamentals from the HiThink official API (valuation + statements).
+
+        Returns canonical field names; every value is optional so the caller can
+        keep falling through to Tencent/AkShare for anything missing.
+        """
+        from app.data_sources import hithink_finance as hithink
+
+        output: Dict[str, Any] = {}
+        thscode = hithink.to_thscode(symbol)
+        project_symbol = hithink.to_project_symbol(thscode)
+        tickers = hithink.valuations([thscode])
+        item = tickers.get(project_symbol) if tickers else None
+        if isinstance(item, dict):
+            pe = _num(item.get("pe_ttm")) or _num(item.get("pe_mrq"))
+            if pe is not None:
+                output["pe_ratio"] = pe
+            if _num(item.get("pb_mrq")) is not None:
+                output["pb_ratio"] = _num(item.get("pb_mrq"))
+            if _num(item.get("ps_ttm")) is not None:
+                output["ps_ratio"] = _num(item.get("ps_ttm"))
+
+        income = hithink.income_statements(symbol, period="quarterly", limit=8)
+        balance = hithink.balance_sheets(symbol, period="quarterly", limit=8)
+        cashflow = hithink.cash_flow_statements(symbol, period="quarterly", limit=8)
+        latest_income = income[0] if income else {}
+        latest_balance = balance[0] if balance else {}
+        latest_cash = cashflow[0] if cashflow else {}
+
+        if _num(latest_income.get("operating_income")) is not None:
+            output["revenue"] = _num(latest_income.get("operating_income"))
+        if _num(latest_income.get("net_profit")) is not None:
+            output["net_income"] = _num(latest_income.get("net_profit"))
+        if _num(latest_income.get("basic_eps")) is not None:
+            output["eps"] = _num(latest_income.get("basic_eps"))
+        if len(income) >= 5:
+            current = _num(income[0].get("operating_income"))
+            previous = _num(income[4].get("operating_income"))
+            if current is not None and previous:
+                output["revenue_growth"] = round((current - previous) / abs(previous) * 100, 2)
+            current_net = _num(income[0].get("net_profit"))
+            ttm = [_num(row.get("net_profit")) for row in income[:4]]
+            if current_net is not None and all(value is not None for value in ttm):
+                output["net_income_ttm"] = float(sum(ttm))
+
+        if _num(latest_balance.get("holder_equity_total")) is not None:
+            output["shareholder_equity"] = _num(latest_balance.get("holder_equity_total"))
+        if _num(latest_balance.get("total_debt")) is not None:
+            output["total_debt"] = _num(latest_balance.get("total_debt"))
+        if _num(latest_balance.get("assets_total")) is not None:
+            output["total_assets"] = _num(latest_balance.get("assets_total"))
+        if _num(latest_balance.get("total_current_assets")) is not None:
+            output["total_current_assets"] = _num(latest_balance.get("total_current_assets"))
+
+        if _num(latest_cash.get("act_cash_flow_net")) is not None:
+            output["operating_cash_flow"] = _num(latest_cash.get("act_cash_flow_net"))
+            capex = _num(latest_cash.get("pay_fixed_assets_etc_cash"))
+            if capex is not None:
+                output["free_cash_flow"] = round(output["operating_cash_flow"] - capex, 2)
+
+        if latest_income.get("period_end_ms") is not None:
+            output["period_end"] = hithink.ms_to_date(latest_income.get("period_end_ms"))
+            output["available_at"] = hithink.ms_to_date(
+                latest_income.get("report_date_ms") or latest_income.get("period_end_ms")
+            )
+
+        indicators = {}
+        report_date = output.get("period_end")
+        if hasattr(report_date, "year"):
+            indicators = hithink.financial_indicators(symbol, hithink.report_period(report_date))
+        if indicators.get("index_weighted_avg_roe") is not None:
+            output["return_on_equity"] = indicators["index_weighted_avg_roe"]
+            output["roe"] = indicators["index_weighted_avg_roe"]
+        if indicators.get("operating_income_yoy_growth_ratio") is not None:
+            output["revenue_growth"] = indicators["operating_income_yoy_growth_ratio"]
+        if indicators.get("assets_debt_ratio") is not None:
+            equity = _num(latest_balance.get("holder_equity_total"))
+            debt = _num(latest_balance.get("total_debt"))
+            if equity:
+                output["debt_to_equity"] = round(debt / equity, 4) if debt is not None else None
+        if indicators.get("current_ratio") is not None:
+            output["current_ratio"] = indicators["current_ratio"]
+        if indicators.get("sale_net_interest_ratio") is not None:
+            output["profit_margin"] = indicators["sale_net_interest_ratio"]
+
+        if not output:
+            return {}
+        output["source"] = "hithink_finance"
+        output["financial_statements"] = self._hithink_statements(
+            income, balance, cashflow, output.get("period_end")
+        )
+        return {key: value for key, value in output.items() if value is not None or key == "source"}
+
+    @staticmethod
+    def _hithink_statements(
+        income: List[Dict[str, Any]],
+        balance: List[Dict[str, Any]],
+        cashflow: List[Dict[str, Any]],
+        period_end: Any,
+    ) -> Dict[str, Any]:
+        from app.data_sources import hithink_finance as hithink
+
+        latest = income[0] if income else {}
+        currency = str(latest.get("currency") or "CNY")
+        return {
+            "_meta": {"source": "hithink_finance", "currency": currency},
+            "latest_quarter": {
+                "period_end": period_end,
+                "income_statement": {
+                    "latest_date": period_end,
+                    "total_revenue": _num(latest.get("operating_income")),
+                    "net_income": _num(latest.get("net_profit")),
+                    "eps_diluted": _num(latest.get("basic_eps")),
+                },
+                "balance_sheet": {
+                    "latest_date": period_end,
+                    "total_assets": _num((balance[0] if balance else {}).get("assets_total")),
+                    "total_equity": _num((balance[0] if balance else {}).get("holder_equity_total")),
+                    "debt": _num((balance[0] if balance else {}).get("total_debt")),
+                },
+                "cash_flow": {
+                    "latest_date": period_end,
+                    "operating_cash_flow": _num((cashflow[0] if cashflow else {}).get("act_cash_flow_net")),
+                },
+            },
+            "income_statement": {
+                "latest_date": period_end,
+                "total_revenue": _num(latest.get("operating_income")),
+                "net_income": _num(latest.get("net_profit")),
+                "eps_diluted": _num(latest.get("basic_eps")),
+            },
+            "balance_sheet": {
+                "latest_date": period_end,
+                "total_assets": _num((balance[0] if balance else {}).get("assets_total")),
+                "total_equity": _num((balance[0] if balance else {}).get("holder_equity_total")),
+                "debt": _num((balance[0] if balance else {}).get("total_debt")),
+            },
+            "cash_flow": {
+                "latest_date": period_end,
+                "operating_cash_flow": _num((cashflow[0] if cashflow else {}).get("act_cash_flow_net")),
+            },
+        }
+
     def _get_cn_hk_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
         CN/HK fundamentals — multi-tier:
+          - HiThink official API for A-share valuation, statements and indicators
           - Tencent quote for current price fields
           - Twelve Data for licensed global statistics and statements when configured
           - AkShare/Eastmoney for domestic valuation and financial statements
@@ -628,7 +789,28 @@ class MarketDataCollector:
                 "source": "tencent_quote",
             }
 
-            # Tier 1: Twelve Data
+            # Tier 1: HiThink official API (A-share valuation + statements + indicators)
+            if not is_hk and _cn_fundamental_primary() == "hithink":
+                try:
+                    from app.data_sources import hithink_finance as hithink
+
+                    if hithink.configured():
+                        hithink_data = self._hithink_fundamental(code)
+                        if hithink_data:
+                            result["source"] = "tencent_quote+hithink_finance"
+                            for k, v in hithink_data.items():
+                                if k == "source":
+                                    continue
+                                if v is not None and result.get(k) is None:
+                                    result[k] = v
+                            hithink_period = hithink_data.get("period_end")
+                            if hithink_period is not None:
+                                result["period_end"] = hithink_period
+                                result["available_at"] = hithink_data.get("available_at") or hithink_period
+                except Exception as e:
+                    logger.warning("HiThink fundamental failed %s:%s: %s", market, symbol, e)
+
+            # Tier 2: Twelve Data
             td = {}
             try:
                 td = fetch_twelvedata_fundamental(code, is_hk)
@@ -636,11 +818,14 @@ class MarketDataCollector:
                 logger.debug("TwelveData fundamental failed %s:%s: %s", market, symbol, e)
 
             if td:
-                result["source"] = "tencent_quote+twelvedata"
+                if "hithink" not in str(result.get("source") or ""):
+                    result["source"] = "tencent_quote+twelvedata"
+                else:
+                    result["source"] += "+twelvedata"
                 for k, v in td.items():
                     if k == "source":
                         continue
-                    if v is not None:
+                    if v is not None and result.get(k) is None:
                         result[k] = v
 
             # Tier 2: AkShare valuation (fill any remaining None fields)

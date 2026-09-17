@@ -14,6 +14,7 @@ from app.data_providers.indices import fetch_stock_indices
 from app.data_providers.opportunities import (
     analyze_opportunities_crypto,
     analyze_opportunities_forex,
+    analyze_opportunities_events,
     analyze_opportunities_local_stocks,
     analyze_opportunities_stocks,
 )
@@ -117,6 +118,7 @@ def compute_trading_opportunities() -> List[Dict[str, Any]]:
         ("USStock", lambda: analyze_opportunities_stocks(opportunities)),
         ("Forex", lambda: analyze_opportunities_forex(opportunities)),
         ("CNStock", lambda: analyze_opportunities_local_stocks(opportunities, "CNStock")),
+        ("hithink_events", lambda: analyze_opportunities_events(opportunities, "CNStock")),
         ("HKStock", lambda: analyze_opportunities_local_stocks(opportunities, "HKStock")),
     ]
     scanners = [(label, fn) for label, fn in candidate_scanners if is_market_visible(label)]

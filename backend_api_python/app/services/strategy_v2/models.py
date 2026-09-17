@@ -91,6 +91,7 @@ class StrategyManifest:
     handlers: tuple[str, ...] = ()
     factor_dependencies: tuple[str, ...] = ()
     fundamental_dependencies: tuple[str, ...] = ()
+    event_dependencies: tuple[str, ...] = ()
     warmup_bars: int = 0
     leverage_allowed: bool = False
     max_leverage: float = 1.0
@@ -138,6 +139,7 @@ class StrategyManifest:
             "handlers": list(self.handlers),
             "factorDependencies": list(self.factor_dependencies),
             "fundamentalDependencies": list(self.fundamental_dependencies),
+            "eventDependencies": list(self.event_dependencies),
             "warmupBars": self.warmup_bars,
             "leverageAllowed": self.leverage_allowed,
             "maxLeverage": self.max_leverage,

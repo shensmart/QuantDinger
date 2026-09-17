@@ -275,6 +275,71 @@ class UniverseService:
             cur.close()
         return self.resolve_members(user_id, universe_id, as_of=STATIC_START)
 
+    def upsert_system_universe(
+        self,
+        *,
+        code: str,
+        name: str,
+        members: list,
+        source: str,
+        source_ref: str = "",
+        metadata: dict | None = None,
+        market: str = "CNStock",
+        universe_type: str = "market",
+        valid_from: date | None = None,
+    ) -> dict:
+        """Create/refresh one system universe and swap its members wholesale.
+
+        ``valid_from`` is the earliest date the snapshot may be used for; board
+        snapshots pass the start of their stored history so a backtest before
+        that date is rejected instead of silently seeing present-day members.
+        """
+        normalized_code = normalize_universe_code(code)
+        if not normalized_code:
+            raise UniverseError("universe.invalidCode")
+        normalized_members = normalize_members(members, default_market=market)
+        payload = json.dumps(dict(metadata or {}), ensure_ascii=False)
+        start = valid_from or STATIC_START
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                INSERT INTO qd_universes
+                  (user_id, code, name, name_i18n_key, market, universe_type,
+                   source, source_ref, is_system, status, metadata_json)
+                VALUES
+                  (NULL, ?, ?, '', ?, ?, ?, ?, TRUE, 'active', ?::jsonb)
+                ON CONFLICT (code) WHERE is_system = TRUE
+                DO UPDATE SET
+                  user_id = NULL,
+                  name = EXCLUDED.name,
+                  market = EXCLUDED.market,
+                  universe_type = EXCLUDED.universe_type,
+                  source = EXCLUDED.source,
+                  source_ref = EXCLUDED.source_ref,
+                  status = EXCLUDED.status,
+                  metadata_json = EXCLUDED.metadata_json,
+                  updated_at = NOW()
+                RETURNING id
+                """,
+                (normalized_code, str(name)[:160], market, universe_type, source, str(source_ref)[:160], payload),
+            )
+            row = cur.fetchone() or {}
+            universe_id = int(row.get("id") or 0)
+            if not universe_id:
+                raise UniverseError("universe.upsertFailed", status_code=500)
+            self._replace_static_members(cur, universe_id, normalized_members, valid_from=start)
+            db.commit()
+            cur.close()
+        return {
+            "universe_id": universe_id,
+            "code": normalized_code,
+            "name": str(name),
+            "source_ref": str(source_ref),
+            "members": len(normalized_members),
+            "valid_from": start.isoformat(),
+        }
+
     def resolve_members(self, user_id: int, universe_id: int, *, as_of: Any = None) -> list[dict]:
         as_of_date = parse_as_of(as_of)
         with get_db_connection() as db:
@@ -445,7 +510,8 @@ class UniverseService:
         return row
 
     @staticmethod
-    def _replace_static_members(cur, universe_id: int, members: list[dict]) -> None:
+    def _replace_static_members(cur, universe_id: int, members: list[dict], *, valid_from: date | None = None) -> None:
+        start = valid_from or STATIC_START
         cur.execute("DELETE FROM qd_universe_members WHERE universe_id = ?", (int(universe_id),))
         for member in members:
             cur.execute(
@@ -459,7 +525,7 @@ class UniverseService:
                 (
                     int(universe_id), member["market"], member["symbol"], member["name"],
                     member["exchange_id"], member["market_type"], member["instrument_id"],
-                    member["settle_currency"], STATIC_START, member.get("weight"),
+                    member["settle_currency"], start, member.get("weight"),
                     member.get("rank"), json.dumps(member.get("metadata") or {}, ensure_ascii=False),
                 ),
             )

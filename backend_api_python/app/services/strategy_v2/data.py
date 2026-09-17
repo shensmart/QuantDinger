@@ -127,12 +127,21 @@ class MultiAssetDataPortal:
         count: int | None = None,
         *,
         frequency: object = None,
+        previous: bool = False,
     ) -> pd.DataFrame:
+        """Window ending at the current bar.
+
+        ``previous=True`` ends one bar earlier, which is what event columns need:
+        a board published after the close of bar D belongs to D, and a strategy
+        handling bar D must look at D-1 to read it.
+        """
         normalized = normalize_frequency(frequency, self.driving_frequency)
         frames = self.frames_for_frequency(normalized)
         key = self.resolve_key(symbol, frequency=normalized)
         frame = frames[key]
         end_index = self._visible_end(key, normalized)
+        if previous and self._include_current and end_index > 0:
+            end_index -= 1
         start_index = max(0, end_index - int(count)) if count is not None and int(count) > 0 else 0
         return frame.iloc[start_index:end_index].copy()
 

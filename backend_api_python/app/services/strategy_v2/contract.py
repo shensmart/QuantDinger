@@ -270,7 +270,7 @@ def compile_strategy_v2(code: str) -> CompiledStrategyV2:
     if not any(name in handlers for name in ("handle_data", "on_rebalance")) and not context.schedules:
         raise StrategyV2ContractError("strategyV2.handlerRequired")
 
-    factors, fundamentals = _discover_dependencies(raw)
+    factors, fundamentals, events = _discover_dependencies(raw)
     if context.leverage_allowed:
         if context.universe_reference or not context.instruments:
             raise StrategyV2ContractError("strategyV2.leverageCryptoSwapOnly")
@@ -313,6 +313,7 @@ def compile_strategy_v2(code: str) -> CompiledStrategyV2:
         handlers=handlers,
         factor_dependencies=tuple(sorted(factors)),
         fundamental_dependencies=tuple(sorted(fundamentals)),
+        event_dependencies=tuple(sorted(events)),
         warmup_bars=context.warmup_bars,
         leverage_allowed=context.leverage_allowed,
         max_leverage=context.max_leverage,
@@ -341,6 +342,7 @@ _DATAFRAME_API_NAMES = {
     "history",
     "get_factors",
     "get_fundamentals",
+    "get_events",
     "indicator",
     "factor",
 }
@@ -361,6 +363,7 @@ _RUNTIME_GLOBAL_CALL_NAMES = {
     "factor",
     "get_factors",
     "get_fundamentals",
+    "get_events",
     "get_history",
     "get_index_stocks",
     "get_position",
@@ -896,13 +899,15 @@ def _schedule_callback(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[s
     return str(getattr(callback, "__name__", "scheduled")), str(kwargs.get("time") or "")
 
 
-def _discover_dependencies(code: str) -> tuple[set[str], set[str]]:
+def _discover_dependencies(code: str) -> tuple[set[str], set[str], set[str]]:
+    """Return (factors, fundamentals, events) declared by the strategy source."""
     factors: set[str] = set()
     fundamentals: set[str] = set()
+    events: set[str] = set()
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return factors, fundamentals
+        return factors, fundamentals, events
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -911,10 +916,13 @@ def _discover_dependencies(code: str) -> tuple[set[str], set[str]]:
             name = node.func.id
         elif isinstance(node.func, ast.Attribute):
             name = node.func.attr
-        if name not in {"indicator", "factor", "get_factors", "get_fundamentals"}:
+        if name not in {"indicator", "factor", "get_factors", "get_fundamentals", "get_events"}:
             continue
         dependency_arg = 1 if name == "get_factors" else 0
         literals = _literal_strings(node.args[dependency_arg]) if len(node.args) > dependency_arg else []
+        if name == "get_events":
+            events.update(literal.lower() for literal in literals)
+            continue
         if name == "get_fundamentals":
             fundamentals.update(literals)
             continue
@@ -928,7 +936,7 @@ def _discover_dependencies(code: str) -> tuple[set[str], set[str]]:
                 fundamentals.update(field.upper() for field in definition.required_fields)
             else:
                 factors.add(literal)
-    return factors, fundamentals
+    return factors, fundamentals, events
 
 
 def _literal_strings(node: ast.AST) -> list[str]:

@@ -21,6 +21,7 @@ FAST_ANALYSIS = "FastAnalysis"
 GLOBAL_MARKET = "GlobalMarket"
 AI_CHAT = "AIChat"
 QUICK_TRADE = "QuickTrade"
+MARKET_EVENTS = "MarketEvents"
 IBKR = "IBKR"
 ALPACA = "Alpaca"
 
@@ -46,6 +47,7 @@ ALL_TAGS = [
     {"name": GLOBAL_MARKET, "description": "Global market overview (Public)"},
     {"name": AI_CHAT, "description": "Legacy AI chat compatibility (Internal)"},
     {"name": QUICK_TRADE, "description": "Manual quick trade (Internal)"},
+    {"name": MARKET_EVENTS, "description": "A-share market event boards (Internal)"},
     {"name": IBKR, "description": "Interactive Brokers adapter (Internal)"},
     {"name": ALPACA, "description": "Alpaca adapter (Internal)"},
 ]

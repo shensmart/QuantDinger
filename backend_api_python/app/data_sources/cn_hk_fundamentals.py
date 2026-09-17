@@ -571,12 +571,11 @@ def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]
 
 def fetch_cn_financial_indicators(tencent_code: str) -> Dict[str, Any]:
     """
-    Fetch revenue growth, debt/equity, current ratio, FCF, margins from
-    Eastmoney financial statements for A-shares.
+    Fetch revenue growth, debt/equity, current ratio, FCF, margins for A-shares.
 
-    Uses:
-      - stock_financial_abstract_ths (同花顺财务摘要) for growth/profitability
-      - stock_financial_analysis_indicator (东财财务分析) as fallback
+    Uses Eastmoney financial statements (``stock_profit_sheet_by_report_em`` and
+    friends) with a pre-computed indicator fallback; the HiThink tier sits
+    ahead of this one in ``market_data_collector``.
     """
     sym6 = ak_a_code_from_tencent(tencent_code)
     if not sym6:

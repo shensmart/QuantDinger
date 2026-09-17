@@ -533,6 +533,89 @@ class StrategyRuntimeContext:
             }
         return pd.DataFrame.from_dict(rows, orient="index")
 
+    def get_events(
+        self,
+        types: object,
+        symbols: object = None,
+        *,
+        as_of: object = None,
+        detail: bool = False,
+    ) -> pd.DataFrame:
+        """Point-in-time market events (limit pools, dragon-tiger, hot rank, ...).
+
+        Returns a frame indexed by instrument key with one column per event
+        field; boolean-ish events are 0/1 and numeric events keep their value.
+        Only events published on or before ``as_of`` (default: the last visible
+        bar) are included: a board is published after the close, so the current
+        day's board is never visible to a strategy running on that same bar.
+        With ``detail=True`` the raw upstream payload of the last visible event
+        per type is returned instead.
+        """
+        from app.services import events_data
+
+        requested_types = [types] if isinstance(types, str) else [str(item) for item in (types or [])]
+        requested_types = [item.strip().lower() for item in requested_types if str(item).strip()]
+        requested_symbols = (
+            [symbols] if isinstance(symbols, str)
+            else list(symbols or self.portal.frames.keys())
+        )
+        if detail:
+            return self._event_details(requested_types, requested_symbols, as_of)
+
+        columns = _event_columns_for(requested_types)
+        rows: dict[str, dict[str, Any]] = {}
+        for symbol in requested_symbols:
+            key = self.portal.resolve_key(symbol)
+            frame = self.portal.visible_frame(key, count=1, previous=True)
+            last = frame.iloc[-1] if not frame.empty else None
+            rows[key] = {
+                column: (float(last.get(column) or 0.0) if last is not None and column in frame.columns else 0.0)
+                for column in columns
+            }
+        return pd.DataFrame.from_dict(rows, orient="index")
+
+    def _event_details(
+        self,
+        requested_types: list[str],
+        requested_symbols: list[object],
+        as_of: object,
+    ) -> pd.DataFrame:
+        from app.services import events_data
+
+        market, symbol = self._event_identity(requested_symbols)
+        cutoff = self._event_cutoff(as_of)
+        rows = events_data.load_points(market, symbol, requested_types, cutoff)
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            event_type = str(row.get("event_type") or "")
+            payload = row.get("payload_json")
+            if isinstance(payload, str):
+                import json
+
+                try:
+                    payload = json.loads(payload)
+                except ValueError:
+                    payload = {}
+            latest[event_type] = payload if isinstance(payload, dict) else {}
+        return pd.DataFrame.from_dict(latest, orient="index")
+
+    def _event_identity(self, requested_symbols: list[object]) -> tuple[str, str]:
+        key = self.portal.resolve_key(requested_symbols[0]) if requested_symbols else ""
+        parts = str(key).split("@", 1)[0].split(":", 1)
+        if len(parts) == 2:
+            return parts[0], parts[1].upper()
+        return "CNStock", str(key).upper()
+
+    def _event_cutoff(self, as_of: object) -> pd.Timestamp:
+        if as_of is not None:
+            stamp = pd.Timestamp(as_of)
+            return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        portal = getattr(self, "portal", None)
+        if portal is not None and getattr(portal, "current_dt", None) is not None:
+            stamp = pd.Timestamp(portal.current_dt)
+            return stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        return pd.Timestamp.now(tz="UTC")
+
     def log(self, message: object) -> None:
         self._logs.append(str(message))
 
@@ -1882,6 +1965,7 @@ class StrategyV2BacktestRunner:
             "factor": ctx.factor,
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
+            "get_events": ctx.get_events,
             "is_trade": ctx.is_trade,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
@@ -2646,6 +2730,7 @@ class StrategyV2LiveSession:
             "factor": ctx.factor,
             "get_factors": ctx.get_factors,
             "get_fundamentals": ctx.get_fundamentals,
+            "get_events": ctx.get_events,
             "is_trade": ctx.is_trade,
             "run_daily": lambda *args, **kwargs: None,
             "run_weekly": lambda *args, **kwargs: None,
@@ -2747,6 +2832,19 @@ def _execution_identity(old_amount: float, target_amount: float, delta: float) -
             return ("open_short" if abs(old_amount) <= 1e-12 else "add_short", "short")
         return ("close_short" if abs(target_amount) <= 1e-12 else "reduce_short", "short")
     return ("reverse_to_long" if target_amount > 0 else "reverse_to_short", "long" if target_amount > 0 else "short")
+
+
+def _event_columns_for(requested_types: list[str]) -> list[str]:
+    """Map requested event types to the numeric columns `get_events` returns."""
+    from app.services.events_data import EVENT_TYPES, EVENT_VALUE_FIELDS
+
+    kinds = requested_types or list(EVENT_TYPES)
+    columns: list[str] = []
+    for kind in kinds:
+        for column in EVENT_VALUE_FIELDS.get(str(kind).lower(), ()):
+            if column not in columns:
+                columns.append(column)
+    return columns
 
 
 def _fundamental_column(value: object) -> str:

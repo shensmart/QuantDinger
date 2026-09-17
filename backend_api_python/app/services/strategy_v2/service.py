@@ -19,6 +19,7 @@ from app.services.backtest_limits import (
     validate_backtest_range,
 )
 from app.services.fundamental_data import get_fundamental_data_service
+from app.services import events_data
 from app.services.instrument_rules import InstrumentRulesProvider, get_instrument_rules_provider
 from app.services.market.instrument_products import PRODUCT_CRYPTO
 from app.services.market.product_catalog import get_catalog_product
@@ -30,7 +31,7 @@ from .factor_research import FactorResearchEngine
 from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
-from .readiness import validate_universe_history, validate_warmup, validate_fundamentals
+from .readiness import validate_universe_history, validate_warmup, validate_fundamentals, validate_events
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
 from .storage import StrategyBacktestRepository
 
@@ -46,6 +47,7 @@ class StrategyV2BacktestService:
         universe_service: UniverseService | None = None,
         frame_fetcher: Callable[..., pd.DataFrame] | None = None,
         fundamental_enricher: Callable[[dict[str, pd.DataFrame], list[dict[str, Any]]], dict[str, pd.DataFrame]] | None = None,
+        event_enricher: Callable[[dict[str, pd.DataFrame], list[dict[str, Any]]], dict[str, pd.DataFrame]] | None = None,
         data_kind: str = "market",
         data_source: str = "system_market_data_router",
         snapshot_store: MarketDataSnapshotStore | None = None,
@@ -55,6 +57,7 @@ class StrategyV2BacktestService:
         self.universe_service = universe_service or get_universe_service()
         self.frame_fetcher = frame_fetcher or load_strategy_frame
         self.fundamental_enricher = fundamental_enricher
+        self.event_enricher = event_enricher
         self.data_kind = str(data_kind or "market")
         self.data_source = str(data_source or "system_market_data_router")
         self.snapshot_store = snapshot_store or MarketDataSnapshotStore()
@@ -114,6 +117,8 @@ class StrategyV2BacktestService:
         if manifest.fundamental_dependencies:
             enricher = self.fundamental_enricher or get_fundamental_data_service().enrich_panel
             frames = enricher(frames, candidates)
+        if manifest.event_dependencies:
+            frames = self._enrich_events(frames, candidates)
         result = FactorResearchEngine().run(
             frames=frames,
             factor_id=factor_id,
@@ -204,6 +209,10 @@ class StrategyV2BacktestService:
             frames = enricher(frames, candidates)
             frequency_frames[frequency] = frames
             self.validate_fundamental_dependencies(frames, manifest)
+        if manifest.event_dependencies:
+            frames = self._enrich_events(frames, candidates)
+            frequency_frames[frequency] = frames
+            self.validate_event_dependencies(frames, manifest)
 
         def resolve_universe(reference: str, timestamp: pd.Timestamp) -> list[str]:
             del reference
@@ -545,6 +554,14 @@ class StrategyV2BacktestService:
     def validate_fundamental_dependencies(frames: dict[str, pd.DataFrame], manifest: StrategyManifest) -> None:
         required = {_normalize_field(item) for item in manifest.fundamental_dependencies}
         validate_fundamentals(frames, required)
+
+    def _enrich_events(self, frames: dict[str, pd.DataFrame], candidates: list[dict[str, Any]]) -> dict[str, pd.DataFrame]:
+        enricher = self.event_enricher or events_data.enrich_panel
+        return enricher(frames, candidates)
+
+    @staticmethod
+    def validate_event_dependencies(frames: dict[str, pd.DataFrame], manifest: StrategyManifest) -> None:
+        validate_events(frames, {_normalize_field(item) for item in manifest.event_dependencies})
 
 
 def _enforce_backtest_range(

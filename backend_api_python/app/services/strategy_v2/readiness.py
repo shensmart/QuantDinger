@@ -47,3 +47,28 @@ def validate_fundamentals(frames, required, as_of=None):
                 problems.append(f"{symbol}/{field}")
     if problems:
         raise StrategyV2ContractError("strategyV2.fundamentalDataMissing:" + ";".join(problems[:6]))
+
+
+def validate_events(frames, required, as_of=None):
+    """Fail fast when a declared event column carries no point-in-time data.
+
+    Event columns are zero-filled during enrichment, so presence alone proves
+    nothing; the column must have been produced by at least one event.
+    """
+    from app.services.events_data import EVENT_VALUE_FIELDS
+
+    known = {field for columns in EVENT_VALUE_FIELDS.values() for field in columns}
+    unknown = sorted(field for field in required if field not in known)
+    if unknown:
+        raise StrategyV2ContractError("strategyV2.eventsUnavailable:" + ";".join(unknown[:6]))
+    problems = []
+    for symbol, frame in frames.items():
+        visible = frame
+        if as_of is not None:
+            visible = frame.loc[pd.to_datetime(frame.index, utc=True) <= pd.to_datetime(as_of, utc=True)]
+        for field in sorted(required):
+            values = pd.to_numeric(visible[field], errors="coerce") if field in visible else pd.Series(dtype=float)
+            if not values.replace([float("inf"), -float("inf")], float("nan")).fillna(0.0).ne(0).any():
+                problems.append(f"{symbol}/{field}")
+    if problems:
+        raise StrategyV2ContractError("strategyV2.eventsUnavailable:" + ";".join(problems[:6]))

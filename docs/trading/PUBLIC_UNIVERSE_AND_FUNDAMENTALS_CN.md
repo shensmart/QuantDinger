@@ -41,7 +41,36 @@ python scripts/refresh_public_universe_snapshots.py \
 
 证券同步会读取 HKEX `ListOfSecurities.xlsx` 的 `Category` 字段，把 `Equity` 和 `Exchange Traded Products` 分开。美国证券目录使用 Nasdaq Trader 的 `ETF` 标记。
 
-## 3. 基本面数据
+## 3. 盘面事件系统池
+
+同花顺官方数据每日落库后，会同步维护 4 个系统池（`is_system=true`，`source=hithink_finance`）：
+
+| 股票池 code | 成员来源 | 刷新 |
+|---|---|---|
+| `hithink_limit_up` | 当日涨停池 | 每日收盘后 |
+| `hithink_limit_up_ladder` | 当日连板梯队 | 每日收盘后 |
+| `hithink_dragon_tiger` | 当日龙虎榜 | 每日收盘后 |
+| `hithink_hot_rank` | 当日热榜 Top N | 每日收盘后 |
+
+这些池是**当日快照**，成员不构成历史成分，因此 `metadata_json` 带 `snapshot_only: true` 与 `snapshot_as_of`，并把 `valid_from` 设为已落库事件的起始日。回测开始日早于该日期时，`validate_universe_history` 会直接拒绝，避免用今天的榜单做历史回测。
+
+时点安全的逐日事件读取请用策略 API `get_events(...)`（见 `STRATEGY_DEV_GUIDE_CN.md`），它读取 `qd_market_events` 而非池成员。
+
+回填与每日增量：
+
+```bash
+# 回填近一年榜单（幂等，可 --resume 断点续传）
+python scripts/backfill_hithink_events.py --days 365 --resume
+
+# 只同步某天，先 dry-run 看数量
+python scripts/backfill_hithink_events.py --date 2026-09-16 --dry-run
+```
+
+`qd_market_events` 的 `available_at` 固定为交易日 15:00（Asia/Shanghai），保证回测不会提前看到当日榜单。上游只保留一年榜单历史，回填窗口上限为 365 天。
+
+---
+
+## 4. 基本面数据
 
 `qd_fundamental_snapshots` 保存时点基本面。最重要的两个日期是：
 
@@ -79,7 +108,7 @@ market,symbol,period_end,available_at,frequency,currency
 
 其余基本面字段可以为空。做小市值策略至少需要 `market_cap`，或同时提供 `shares_outstanding` 和日线收盘价。
 
-## 4. 已知限制
+## 5. 已知限制
 
 - 公开快照适合产品启动和研究验证，不等价于官方商业指数授权。
 - 标普和纳斯达克名称、原始成分展示及商业使用仍应在正式运营前复核许可。

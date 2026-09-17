@@ -381,6 +381,94 @@ def analyze_opportunities_local_stocks(opportunities: list, market: str):
             })
 
 
+def analyze_opportunities_events(opportunities: list, market: str = "CNStock"):
+    """Scan today's HiThink boards for event-driven A-share opportunities."""
+    from app.services import events_data
+
+    if str(market or "").strip() != "CNStock":
+        return
+    try:
+        limit_up = events_data.query_events(event_types=["limit_up"], limit=100)
+        dragon_tiger = events_data.query_events(event_types=["dragon_tiger_all"], limit=100)
+        hot_rank = events_data.query_events(event_types=["hot_rank"], limit=30)
+        anomalies = events_data.query_events(event_types=["anomaly"], limit=100)
+    except Exception as exc:  # noqa: BLE001 - scanning must not break the endpoint
+        logger.warning("analyze_opportunities_events: event data unavailable: %s", exc)
+        return
+
+    seen: set[str] = set()
+
+    def _add(item: dict, signal: str, strength: str, reason: str, impact: str) -> None:
+        symbol = str(item.get("symbol") or "")
+        if not symbol or symbol in seen:
+            return
+        seen.add(symbol)
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        opportunities.append({
+            "symbol": symbol,
+            "name": str(item.get("name") or symbol),
+            "price": safe_float(payload.get("last_price")),
+            "change_24h": safe_float(payload.get("price_change_ratio_pct")),
+            "signal": signal,
+            "strength": strength,
+            "reason": reason,
+            "impact": impact,
+            "market": "CNStock",
+            "timestamp": int(_time.time()),
+        })
+
+    for item in limit_up.get("items", []):
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        days = int(payload.get("continue_day_cnt") or 1)
+        seal = safe_float(payload.get("seal_money"))
+        _add(
+            item,
+            "limit_up_seal",
+            "strong" if days >= 3 else "medium",
+            f"涨停{payload.get('continue_day_text') or f'{days}连板'}，封单额{seal / 1e8:.2f}亿"
+            f"（{payload.get('limit_up_reason') or '无明确原因'}）",
+            "bullish",
+        )
+
+    for item in dragon_tiger.get("items", []):
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        net = safe_float(payload.get("net_value"))
+        if net <= 0:
+            continue
+        _add(
+            item,
+            "dragon_tiger_inflow",
+            "strong" if net >= 1e8 else "medium",
+            f"龙虎榜净买入{net / 1e8:.2f}亿元"
+            f"（{payload.get('limit_reason') or '资金关注'}）",
+            "bullish",
+        )
+
+    for item in hot_rank.get("items", []):
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        change = payload.get("rank_change")
+        if change is None or safe_float(change) <= 0:
+            continue
+        _add(
+            item,
+            "hot_rank_surge",
+            "medium",
+            f"同花顺热榜第{item.get('rank')}名，排名上升{int(safe_float(change))}位",
+            "bullish",
+        )
+
+    for item in anomalies.get("items", []):
+        payload = item.get("payload_json") if isinstance(item.get("payload_json"), dict) else {}
+        _add(
+            item,
+            "anomaly",
+            "weak",
+            f"个股异动：{payload.get('tag_name') or '异动'}"
+            f"（{str(payload.get('analysis_content') or '')[:60]}）",
+            "neutral",
+        )
+
+
 def analyze_opportunities_forex(opportunities: list):
     """Scan forex pairs for trading opportunities."""
     forex_data = get_cached("forex_pairs")

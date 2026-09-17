@@ -270,6 +270,16 @@ def _start_scheduler_services(*, include_celery_managed: bool = False) -> None:
     except Exception:
         logger.error("Failed to start initial market catalog sync", exc_info=True)
 
+    if include_celery_managed:
+        # Celery runs on its own broker; when a scheduler role has no beat, this
+        # keeps the daily HiThink board sync alive from the API/scheduler process.
+        try:
+            from app.services.hithink_events_sync import start_event_sync_worker
+
+            start_event_sync_worker()
+        except Exception:
+            logger.error("Failed to start HiThink event sync worker", exc_info=True)
+
     if not include_celery_managed:
         return
     try:

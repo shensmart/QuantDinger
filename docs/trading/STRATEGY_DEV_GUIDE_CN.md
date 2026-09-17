@@ -499,6 +499,23 @@ fundamentals = get_fundamentals(
 
 常用公开别名还包括 <code>REVENUE_GROWTH</code>、<code>DEBT_TO_EQUITY</code> 和 <code>FREE_CASH_FLOW</code>。只使用平台真实支持、按时点可见的字段，不要发明字段或读取未来财报。
 
+盘面事件（涨停/跌停/炸板池、连板天梯、龙虎榜、热榜、个股异动）：
+
+~~~python
+def initialize(context):
+    context.set_universe("hithink_limit_up")
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    events = get_events(["limit_up", "dragon_tiger_all", "hot_rank"])
+    if events.loc[g.symbol, "limit_up"] and events.loc[g.symbol, "hot_rank"] <= 50:
+        order_target_percent(g.symbol, 0.1)
+~~~
+
+`get_events` 与 `get_fundamentals` 一样是点内语义：榜单在收盘后发布，处理 D 日 bar 的策略看到的是 D-1 及更早的榜单，绝不会看到当日收盘后才可见的数据。布尔型事件返回 0/1，数值型事件返回原值（`hot_rank` 排名、`dragon_tiger_net` 净买入额、`limit_up_days` 连板数、`seal_money` 封单额）。需要上游原始字段时用 `get_events(["limit_up"], detail=True)`。
+
+可用事件类型：`limit_up`、`limit_down`、`limit_break`、`limit_up_ladder`、`dragon_tiger_all`、`dragon_tiger_org`、`dragon_tiger_hot_money`、`hot_rank`、`anomaly`、`skyrocket`。声明的类型会写入策略清单的 `eventDependencies`；若回测区间内该事件没有任何数据，前置校验会直接抛 `strategyV2.eventsUnavailable`，不会静默返回全 0。
+
 美股与港股股票池支持持久化当前快照和历史季度财报导入。交易所路由股票（如 <code>Crypto:00700/HKD@gate:spot</code>）会通过底层 <code>HKStock:00700</code> 身份读取时点基本面，同时保留准确的 Gate 产品身份用于实盘下单。
 
 多标的 <code>factor</code>/<code>indicator</code> 调用必须传 symbol；只有单标的数据门户可以省略 symbol。

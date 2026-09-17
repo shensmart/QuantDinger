@@ -555,6 +555,18 @@ cross_up = (
 
 如果信号必须等当前 bar 收盘才能确定，转换成策略后应在下一根 bar 执行，不要为了让图形更漂亮而把信号提前。
 
+### 盘面事件（`get_events`）
+
+策略运行时可读取同花顺盘面事件（涨停/跌停/炸板池、连板天梯、龙虎榜、热榜、个股异动）：
+
+~~~python
+events = get_events(["limit_up", "hot_rank"])
+is_limit_up = events.loc[symbol, "limit_up"] == 1
+hot_rank = events.loc[symbol, "hot_rank"]
+~~~
+
+榜单在收盘后发布，因此处理 D 日 bar 时读到的是 D-1 及更早的榜单，与 `get_fundamentals` 的时点可见性规则一致。指标画图本身不调用该 API；它只在"指标转策略"后的运行阶段可用，转换时应把事件条件写成显式的 `get_events(...)` 调用，让依赖被策略清单记录。
+
 ---
 
 ## 13. 沙箱与安全限制
