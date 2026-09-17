@@ -919,7 +919,7 @@ def upsert_symbol_master(rows: Sequence[SymbolMasterRow]) -> int:
                     row.instrument_id,
                     row.settle_currency,
                     asset_class,
-                    row.product_type or "crypto",
+                    row.product_type or asset_class,
                     row.api_family or row.market_type or "spot",
                     row.underlying_market or "",
                     row.underlying_symbol or "",

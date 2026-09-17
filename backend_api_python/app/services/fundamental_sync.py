@@ -1,5 +1,6 @@
 """Persistent universe fundamental jobs; external IO never holds a DB connection."""
 import json
+import os
 import uuid
 from app.services.fundamental_data import FUNDAMENTAL_FIELDS, get_fundamental_data_service
 from app.services.universe import get_universe_service
@@ -8,6 +9,14 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 DEFAULT_FIELDS = list(FUNDAMENTAL_FIELDS)
+DEFAULT_MAX_MEMBERS = 10000
+
+
+def max_members():
+    try:
+        return max(1, int(os.getenv('FUNDAMENTAL_SYNC_MAX_MEMBERS', DEFAULT_MAX_MEMBERS)))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_MEMBERS
 
 
 def query(sql, params=(), many=False):
@@ -33,7 +42,7 @@ def fields_for(raw=None):
 def members_for(user_id, universe_id):
     members = get_universe_service().resolve_members(user_id, universe_id)
     members = list({(m['market'], m['symbol']): m for m in members}.values())
-    if not members or len(members) > 5000 or any(m['market'] not in {'USStock', 'HKStock', 'CNStock'} for m in members):
+    if not members or len(members) > max_members() or any(m['market'] not in {'USStock', 'HKStock', 'CNStock'} for m in members):
         raise ValueError('fundamentalSync.unsupportedUniverse')
     return members
 
@@ -129,8 +138,11 @@ def run_one():
     except Exception as exc:
         logger.exception('Fundamental sync failed job=%s market=%s symbol=%s', row['job_id'], row['market'], row['symbol'])
         error = 'fundamentalSync.providerFailed'
+        if isinstance(exc, ValueError) and str(exc) == 'factor.fundamentalDataUnavailable':
+            error = 'fundamentalSync.dataUnavailable'
         error_detail = f'{type(exc).__name__}: {exc}'[:500]
-    status = ('failed' if row['attempts'] >= 3 else 'pending') if error else 'success'
+    retryable = error != 'fundamentalSync.dataUnavailable'
+    status = ('failed' if row['attempts'] >= 3 or not retryable else 'pending') if error else 'success'
     query('''UPDATE qd_fundamental_sync_items SET status=%s,error=%s,error_detail=%s,token=NULL,lease_until=NULL,
         retry_at=NOW()+INTERVAL '60 seconds',updated_at=NOW() WHERE id=%s AND token=%s''',
         (status, error, error_detail, row['id'], token))
