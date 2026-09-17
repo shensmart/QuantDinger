@@ -49,15 +49,15 @@ RUN set -eux; \
 
 COPY requirements.txt requirements.lock ./
 
-# Pip: when BUILD_REGION=cn, try Aliyun PyPI first; on any failure retry default index.
+# Pip: when BUILD_REGION=cn, try Tsinghua PyPI first; on any failure retry default index.
 # Otherwise install from PyPI official directly.
 RUN set -eux; \
     if [ "$BUILD_REGION" = "cn" ]; then \
       python -m pip install --no-cache-dir --timeout 180 --retries 5 --upgrade \
-          -i https://mirrors.aliyun.com/pypi/simple/ \
+          -i https://pypi.tuna.tsinghua.edu.cn/simple \
           "pip>=26.1.2,<27"; \
       pip install --no-cache-dir --prefer-binary --timeout 180 \
-          -i https://mirrors.aliyun.com/pypi/simple/ \
+          -i https://pypi.tuna.tsinghua.edu.cn/simple \
           -r requirements.lock \
         || pip install --no-cache-dir --prefer-binary --timeout 180 -r requirements.lock; \
     else \
