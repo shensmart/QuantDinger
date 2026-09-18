@@ -35,6 +35,10 @@ logger = get_logger(__name__)
 dragon_tiger_blp = Blueprint("dragon_tiger", __name__)
 
 CACHE_TTL_SECONDS = 180
+# Keep an empty result only briefly: a trade date whose board is not published
+# yet (Eastmoney usually posts it between 17:00 and 19:00 Asia/Shanghai) would
+# otherwise be pinned as "no data" for a full TTL.
+EMPTY_CACHE_TTL_SECONDS = 30
 _MAX_ENTRIES = 64
 
 _cache: Dict[str, Any] = {}
@@ -56,13 +60,14 @@ def _cached(key: str, producer: Callable[[], List[Dict[str, Any]]]) -> List[Dict
         if entry and entry[0] > now:
             return entry[1]
     rows = producer()
+    ttl = CACHE_TTL_SECONDS if rows else EMPTY_CACHE_TTL_SECONDS
     with _cache_lock:
         if len(_cache) >= _MAX_ENTRIES:
             for stale in [name for name, value in _cache.items() if value[0] <= now]:
                 _cache.pop(stale, None)
             if len(_cache) >= _MAX_ENTRIES:
                 _cache.pop(next(iter(_cache)), None)
-        _cache[key] = (now + CACHE_TTL_SECONDS, rows)
+        _cache[key] = (now + ttl, rows)
     return rows
 
 
@@ -70,8 +75,12 @@ def _default_trade_date() -> str:
     """Empty request -> most recent trade date already stored in the event table."""
     from app.services import events_data
 
-    latest = events_data.latest_trade_dates(["dragon_tiger_all"])
-    found = latest.get("dragon_tiger_all")
+    latest = events_data.latest_trade_dates([
+        "dragon_tiger_all",
+        "dragon_tiger_org",
+        "dragon_tiger_hot_money",
+    ])
+    found = max((value for value in latest.values() if value), default=None)
     if found:
         return found.isoformat()
     return hithink.shanghai_today().isoformat()
@@ -97,6 +106,17 @@ def _window_arg() -> str:
     return (request.args.get("window") or "近一月").strip()
 
 
+def _board_payload(day: str, rows: List[Dict[str, Any]], limit: int) -> Dict[str, Any]:
+    """Board responses share one shape; ``trade_date`` echoes the served date so
+    the UI can label an empty board instead of looking broken."""
+    return {
+        "trade_date": day,
+        "source": eastmoney_lhb.SOURCE,
+        "total": len(rows),
+        "items": rows[:limit],
+    }
+
+
 @dragon_tiger_blp.route("/dragon-tiger/daily", methods=["GET"])
 @login_required
 def dragon_tiger_daily():
@@ -106,7 +126,7 @@ def dragon_tiger_daily():
         return _failure("invalid trade_date")
     rows = _cached(f"daily:{day}", lambda: eastmoney_lhb.daily_detail(day))
     limit = _limit_arg(500)
-    return _success({"trade_date": day, "source": eastmoney_lhb.SOURCE, "total": len(rows), "items": rows[:limit]})
+    return _success(_board_payload(day, rows, limit))
 
 
 @dragon_tiger_blp.route("/dragon-tiger/institutions", methods=["GET"])
@@ -117,7 +137,7 @@ def dragon_tiger_institutions():
     if not day:
         return _failure("invalid trade_date")
     rows = _cached(f"seats:{day}", lambda: eastmoney_lhb.institutional_seats(day))
-    return _success({"trade_date": day, "source": eastmoney_lhb.SOURCE, "total": len(rows), "items": rows[:_limit_arg(500)]})
+    return _success(_board_payload(day, rows, _limit_arg(500)))
 
 
 @dragon_tiger_blp.route("/dragon-tiger/branches", methods=["GET"])
@@ -128,7 +148,7 @@ def dragon_tiger_branches():
     if not day:
         return _failure("invalid trade_date")
     rows = _cached(f"branches:{day}", lambda: eastmoney_lhb.active_branches(day))
-    return _success({"trade_date": day, "source": eastmoney_lhb.SOURCE, "total": len(rows), "items": rows[:_limit_arg(500)]})
+    return _success(_board_payload(day, rows, _limit_arg(500)))
 
 
 @dragon_tiger_blp.route("/dragon-tiger/statistics", methods=["GET"])
