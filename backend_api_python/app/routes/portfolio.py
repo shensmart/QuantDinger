@@ -448,7 +448,7 @@ def add_monitor():
 
                 def _initial_run():
                     try:
-                        _run_single_monitor(int(monitor_id), user_id=int(user_id))
+                        _run_single_monitor(int(monitor_id), user_id=int(user_id), force=True)
                     except Exception as ex:
                         logger.error(f"Initial portfolio monitor run failed #{monitor_id}: {ex}")
 
@@ -593,7 +593,7 @@ def run_monitor_now(monitor_id):
             
             def run_in_background(mid, lang, uid):
                 try:
-                    run_single_monitor(mid, override_language=lang, user_id=uid)
+                    run_single_monitor(mid, override_language=lang, user_id=uid, force=True)
                 except Exception as e:
                     logger.error(f"Background monitor run failed: {e}")
             
@@ -614,7 +614,7 @@ def run_monitor_now(monitor_id):
             })
         else:
             # Sync mode: Wait for completion (may timeout)
-            result = run_single_monitor(monitor_id, override_language=language, user_id=user_id)
+            result = run_single_monitor(monitor_id, override_language=language, user_id=user_id, force=True)
             return jsonify({'code': 1, 'msg': 'success', 'data': result})
             
     except Exception as e:

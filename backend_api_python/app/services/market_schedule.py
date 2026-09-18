@@ -7,6 +7,10 @@ from typing import Optional
 
 import pandas as pd
 
+from app.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 CALENDAR_BY_MARKET = {
     "USStock": "XNYS",
@@ -78,6 +82,28 @@ def next_rebalance_run(
     raise MarketScheduleError("portfolio.nextMarketSessionUnavailable")
 
 
+def is_market_open(market: str, now: Optional[datetime] = None) -> bool:
+    """True while ``market`` is inside a live session right now.
+
+    Continuous markets (crypto) are always open. A market with no configured
+    calendar stays open on purpose: an unknown market must keep its monitor
+    running rather than be silently muted.
+    """
+    if _is_continuous_market(market):
+        return True
+    code = CALENDAR_BY_MARKET.get(str(market or "").strip())
+    if not code:
+        return True
+    try:
+        return bool(_calendar(market).is_open_on_minute(pd.Timestamp(_utc(now))))
+    except Exception as exc:  # noqa: BLE001 - not knowing the session must not mute a monitor
+        # Covers a missing exchange_calendars install, an unreadable calendar,
+        # and MinuteOutOfBounds once now passes the bundled calendar's last
+        # session (the package ships ~1 year ahead).
+        logger.warning("Market calendar unusable for %s (%s); treating as open", market, exc)
+        return True
+
+
 def _is_period_end(sessions, index: int, frequency: str) -> bool:
     if frequency == "daily":
         return True
@@ -117,3 +143,12 @@ def _python_utc(value) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.tz_localize("UTC")
     return parsed.tz_convert("UTC").to_pydatetime()
+
+
+__all__ = [
+    "CALENDAR_BY_MARKET",
+    "MarketScheduleError",
+    "is_market_open",
+    "latest_completed_session",
+    "next_rebalance_run",
+]

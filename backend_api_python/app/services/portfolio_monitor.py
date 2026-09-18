@@ -35,6 +35,38 @@ _stop_event = threading.Event()
 
 MAX_ALERTS_PER_MONITOR_TICK = 300
 
+# Minutes a closed-market monitor waits before re-checking the calendar. Short
+# enough that the first session after the open resumes quickly, cheap because a
+# skipped tick is one UPDATE and no upstream call.
+CLOSED_MARKET_RETRY_MINUTES = 10
+
+
+def _market_of(positions: List[Dict[str, Any]], config: Dict[str, Any]) -> str:
+    """Market to check the session calendar against for this monitor tick."""
+    configured = str(config.get('market') or '').strip()
+    if configured:
+        return configured
+    markets = {(p.get('market') or '').strip() for p in positions}
+    markets.discard('')
+    return next(iter(markets)) if len(markets) == 1 else ''
+
+
+def _market_closed(
+    positions: List[Dict[str, Any]], config: Dict[str, Any], now=None
+) -> bool:
+    """True when this tick falls outside the trading session of the market.
+
+    A monitor named "盘中每小时跟踪" is still just a fixed interval, so without
+    this guard it keeps paying for AI analysis after the close. Unknown or
+    mixed markets return False: a calendar we cannot read must not mute it.
+    """
+    market = _market_of(positions, config)
+    if not market:
+        return False
+    from app.services.market_schedule import is_market_open
+
+    return not is_market_open(market, now)
+
 
 def _due_monitor_batch_limit() -> int:
     try:
@@ -1391,6 +1423,7 @@ def run_single_monitor(
     override_language: str = None,
     user_id: int = None,
     skip_notification: bool = False,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Run a single monitor and return the result.
 
@@ -1399,6 +1432,7 @@ def run_single_monitor(
         override_language: Optional language override (e.g., 'zh-CN', 'en-US')
         user_id: Optional user ID for user isolation
         skip_notification: If True, do NOT send a notification (caller will batch-send later)
+        force: If True, ignore the trading-session guard (a human asked for it now)
     """
     try:
         effective_user_id = user_id if user_id is not None else DEFAULT_USER_ID
@@ -1504,6 +1538,24 @@ def run_single_monitor(
             return skip_result
 
         # Billing check before running monitor analysis.
+        if monitor_type == 'ai' and not force and _market_closed(positions, config):
+            logger.info(
+                f"Monitor #{monitor_id} skipped: {_market_of(positions, config)} market closed"
+            )
+            skip_result = {
+                'success': False,
+                'error': 'Market closed',
+                'skipped': True,
+                'timestamp': _now_ts(),
+            }
+            _bump_monitor_schedule(
+                monitor_id,
+                min(interval_minutes, CLOSED_MARKET_RETRY_MINUTES),
+                skip_result,
+                skipped=True,
+            )
+            return skip_result
+
         billing = get_billing_service()
         symbol_count = len(positions)
         per_symbol_cost = billing.get_feature_cost('ai_analysis')
