@@ -48,6 +48,7 @@ celery_app.conf.update(
         "app.tasks.maintenance",
         "app.tasks.fundamental_sync",
         "app.tasks.hithink_events",
+        "app.tasks.symbol_tags",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -59,6 +60,8 @@ celery_app.conf.update(
         "quantdinger.tasks.fundamental_sync_tick": {"queue": "maintenance"},
         "quantdinger.tasks.hithink_events_tick": {"queue": "maintenance"},
         "quantdinger.tasks.hithink_events_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.symbol_tag_tick": {"queue": "maintenance"},
+        "quantdinger.tasks.symbol_tag_sync": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -70,6 +73,12 @@ celery_app.conf.update(
         "hithink-events-sync": {
             "task": "quantdinger.tasks.hithink_events_tick",
             "schedule": max(300, int(os.getenv("HITHINK_EVENTS_SYNC_TICK_SEC", "600"))),
+        },
+        # One tick drives both families: sector constituents once after the
+        # close, quote thresholds every SYMBOL_TAG_QUOTE_TICK_SEC while trading.
+        "symbol-tag-sync": {
+            "task": "quantdinger.tasks.symbol_tag_tick",
+            "schedule": max(60, int(os.getenv("SYMBOL_TAG_QUOTE_TICK_SEC", "300"))),
         },
         "expire-billed-agent-jobs": {
             "task": "quantdinger.tasks.expire_agent_jobs",

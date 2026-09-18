@@ -1,9 +1,15 @@
-"""HiThink board synchronization: daily incremental, backfill, and universe refresh.
+"""HiThink board synchronization: daily incremental and backfill.
 
 The scheduler calls :func:`schedule_due` on a short beat; it only dispatches the
 real sync once per trading day after the configured close time, so restarting
 the beat container cannot double-write (the event table's unique key would make
 a double write harmless anyway).
+
+Boards used to be mirrored into ``hithink_*`` system universes. They are now
+``event`` tags read straight from ``qd_market_events`` (see
+``app/services/symbol_tags.py``): the boards are already point-in-time via
+``available_at``, so the mirror only duplicated rows and re-dated membership to
+the newest snapshot.
 """
 
 from __future__ import annotations
@@ -11,24 +17,13 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date
 
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _thread: threading.Thread | None = None
-
-# System universes rebuilt from the boards. (code prefix, name, event type,
-# member cap) — the boards are daily snapshots, so each carries snapshot_only
-# metadata and backtest readiness rejects dates before the snapshot.
-UNIVERSE_POOLS: tuple[tuple[str, str, str, int], ...] = (
-    ("hithink_limit_up", "HiThink Limit-Up Pool", "limit_up", 300),
-    ("hithink_limit_up_ladder", "HiThink Limit-Up Ladder", "limit_up_ladder", 200),
-    ("hithink_dragon_tiger", "HiThink Dragon-Tiger List", "dragon_tiger_all", 300),
-    ("hithink_hot_rank", "HiThink Hot Rank", "hot_rank", 100),
-)
-
 
 def _int_env(name: str, default: int) -> int:
     try:
@@ -138,7 +133,7 @@ def start_event_sync_worker() -> None:
 
 
 def run_sync(*, event_types, trigger_type: str = "schedule", as_of: date | None = None) -> dict:
-    """Fetch today's boards, persist them, then refresh the system universes."""
+    """Fetch today's boards and persist them; event tags read the result."""
     from app.data_sources import hithink_finance as hithink
     from app.services import events_data
 
@@ -164,100 +159,14 @@ def run_sync(*, event_types, trigger_type: str = "schedule", as_of: date | None 
         failures=len(report["failures"]),
         detail=report,
     )
-    pools = refresh_universe_pools(day) if not report["failures"] else {"skipped": "sync_failures"}
-    return {**report, "universes": pools}
-
-
-def refresh_universe_pools(day: date, *, dry_run: bool = False) -> dict:
-    """Rebuild the four system universes from the stored boards.
-
-    ponytail: members are replaced wholesale, so ``history_from`` always equals
-    the newest snapshot. That is the honest semantic for a daily board snapshot
-    (``snapshot_only``); per-date point-in-time membership would need a
-    membership history table that only `get_events` actually needs.
-    """
-    from app.services.universe import UniverseService
-    from app.services import events_data
-
-    # daily boards are the source of the pool universes
-    service = UniverseService()
-    results: list[dict] = []
-    failures: list[dict] = []
-    start = _pool_history_from(day)
-    for code, name, event_type, cap in UNIVERSE_POOLS:
-        try:
-            page = events_data.query_events(
-                event_types=[event_type],
-                trade_date=day,
-                limit=cap,
-            )
-            members = [
-                {
-                    "market": str(item.get("market") or events_data.MARKET),
-                    "symbol": str(item.get("symbol") or ""),
-                    "name": str(item.get("name") or ""),
-                    "rank": item.get("rank"),
-                    "metadata": {
-                        "source": events_data.SOURCE,
-                        "event_type": event_type,
-                        "trade_date": day.isoformat(),
-                    },
-                }
-                for item in page["items"]
-                if item.get("symbol")
-            ]
-            if dry_run:
-                results.append({"code": code, "members": len(members)})
-                continue
-            results.append(
-                service.upsert_system_universe(
-                    code=code,
-                    name=name,
-                    members=members,
-                    source=events_data.SOURCE,
-                    source_ref=f"hithink:{event_type}",
-                    valid_from=start,
-                    metadata={
-                        "source": events_data.SOURCE,
-                        "event_type": event_type,
-                        "snapshot_only": True,
-                        "snapshot_as_of": start.isoformat(),
-                        "snapshot_latest": day.isoformat(),
-                        "member_count": len(members),
-                    },
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("universe pool refresh failed code=%s", code)
-            failures.append({"code": code, "error": str(exc)[:200]})
-    return {"results": results, "failures": failures}
-
-
-def _pool_history_from(day: date) -> date:
-    """Start of the stored board history, so recent backtests stay usable."""
-    earliest = _earliest_event_date()
-    floor = day - timedelta(days=backfill_days())
-    return max(floor, earliest) if earliest is not None else floor
-
-
-def _earliest_event_date() -> date | None:
-    from app.utils.db import get_db_connection
-
-    with get_db_connection() as db:
-        cur = db.cursor()
-        cur.execute("SELECT MIN(trade_date) AS first_date FROM qd_market_events")
-        row = cur.fetchone() or {}
-        cur.close()
-    return row.get("first_date")
+    return report
 
 
 __all__ = [
-    "UNIVERSE_POOLS",
     "sync_enabled",
     "backfill_days",
     "due_now",
     "schedule_due",
     "run_sync",
-    "refresh_universe_pools",
     "start_event_sync_worker",
 ]

@@ -53,7 +53,10 @@ def _clean_visible_narrative(value: Any) -> tuple[Any, bool]:
 
 
 class AnalysisSections(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # Ignore, not forbid: a stray narrative key inside this sub-object
+    # (analysis.sentiment_note, analysis.missing_inputs, ...) must not discard
+    # the whole analysis. The top-level FastAnalysisNarrative stays strict.
+    model_config = ConfigDict(extra="ignore")
 
     technical: str = ""
     fundamental: str = ""

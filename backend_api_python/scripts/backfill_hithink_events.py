@@ -23,10 +23,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.services import events_data  # noqa: E402
-from app.services.hithink_events_sync import (  # noqa: E402
-    UNIVERSE_POOLS,
-    refresh_universe_pools,
-)
 from app.utils.logger import get_logger  # noqa: E402
 
 logger = get_logger(__name__)
@@ -53,7 +49,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit-days", type=int, default=None, help="only process the newest N dates (smoke runs)")
     parser.add_argument("--resume", action="store_true", help="skip (date, event type) pairs already stored")
     parser.add_argument("--dry-run", action="store_true", help="fetch without writing")
-    parser.add_argument("--skip-universes", action="store_true", help="do not refresh system pools")
     args = parser.parse_args(argv)
 
     event_types = [str(item).strip().lower() for item in args.only if str(item).strip()] or list(
@@ -90,10 +85,6 @@ def main(argv: list[str] | None = None) -> int:
         if index % 10 == 0:
             logger.info("backfill progress %s/%s", index, len(dates))
 
-    universes: dict = {"skipped": True}
-    if not args.dry_run and not args.skip_universes and processed:
-        universes = refresh_universe_pools(dates[-1])
-
     summary = {
         "dryRun": bool(args.dry_run),
         "eventTypes": event_types,
@@ -102,8 +93,6 @@ def main(argv: list[str] | None = None) -> int:
         "rowsWritten": sum(item["written"] for item in processed),
         "failures": len(failures),
         "failureSample": failures[:20],
-        "universes": universes,
-        "universePools": [item[0] for item in UNIVERSE_POOLS],
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 1 if failures and not processed else 0

@@ -109,7 +109,15 @@ def normalize_pool_reference(value: object) -> str:
     raw = str(value or "").strip()
     if not raw:
         raise InstrumentParseError("strategyV2.universeRequired")
-    if raw.upper().startswith("POOL:"):
+    upper = raw.upper()
+    # ``TAG:<code>`` is a single-tag reference; ``POOL:<code>`` points at a saved
+    # universe (manual, watchlist, index, or a smart condition pool).
+    if upper.startswith("TAG:"):
+        code = raw.split(":", 1)[1].strip().lower()
+        if not code:
+            raise InstrumentParseError("strategyV2.universeRequired")
+        return f"TAG:{code}"
+    if upper.startswith("POOL:"):
         raw = raw.split(":", 1)[1]
     return f"POOL:{raw.lower()}"
 

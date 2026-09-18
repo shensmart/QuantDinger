@@ -195,39 +195,47 @@ def _fetch_sectors_heatmap() -> List[Dict[str, Any]]:
 
 
 def _fetch_cn_sectors_heatmap() -> List[Dict[str, Any]]:
-    """A-share sector heatmap from the THS industry/concept universes.
+    """A-share sector heatmap from the industry/concept symbol tags.
 
     Each sector's move is the equal-weighted average of its members' snapshot
-    change, so it needs no extra endpoint beyond the one the pools already use.
+    change, so it needs no extra endpoint beyond the one the screener already
+    uses. Sectors are tags, not universes, since a sector is a label rather
+    than a strategy input.
     """
     cached = get_cached("heatmap_cn_sectors")
     if cached:
         return cached
     try:
         from app.data_sources import hithink_finance as hithink
-        from app.services.universe import get_universe_service
+        from app.services.symbol_tags import get_symbol_tag_service
 
-        universes = [
-            item
-            for item in get_universe_service().list_universes(0)
-            if item.get("is_system") and str(item.get("code") or "").startswith(("cn_industry_", "cn_concept_"))
+        tag_service = get_symbol_tag_service()
+        tags = [
+            tag for tag in tag_service.list_tags()
+            if tag.get("category") in ("industry", "concept")
         ]
-        if not universes or not hithink.configured():
+        if not tags or not hithink.configured():
             return []
+        # Sectors overlap heavily, so fetch each symbol's quote once.
         codes: List[str] = []
-        universe_members: Dict[str, List[str]] = {}
-        for universe in universes[:20]:
-            rows = get_universe_service().resolve_members(0, int(universe["id"]))
+        tag_members: Dict[str, List[str]] = {}
+        for tag in tags[:20]:
+            rows = tag_service.resolve_members(tag["code"], limit=800)
             symbols = [str(row.get("symbol") or "") for row in rows if row.get("symbol")]
-            universe_members[str(universe.get("name") or universe.get("code"))] = symbols
+            tag_members[str(tag.get("name") or tag.get("code"))] = symbols
             codes.extend(symbols)
+        # `snapshot()` returns raw items keyed by thscode (``600519.SH``), not by
+        # the project symbol, so the quotes map must be built through
+        # ``to_project_symbol`` — keying on ``item['symbol']`` (as this used to)
+        # produced a single ``None`` key and an always-empty sector list.
         quotes = {
-            item.get("symbol"): hithink.snapshot_to_ticker(item)
+            hithink.to_project_symbol(str(item.get("thscode") or "")):
+                hithink.snapshot_to_ticker(item)
             for item in hithink.snapshot(sorted(set(codes))[:800])
             if item.get("thscode")
         }
         rows_out: List[Dict[str, Any]] = []
-        for name, symbols in universe_members.items():
+        for name, symbols in tag_members.items():
             changes = [quotes[symbol]["changePercent"] for symbol in symbols if symbol in quotes]
             if not changes:
                 continue

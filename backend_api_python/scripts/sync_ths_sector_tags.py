@@ -1,13 +1,19 @@
-"""Sync Tonghuashun industry and concept universes from HiThink Financial API.
+"""Sync Tonghuashun industry and concept *tags* from HiThink Financial API.
 
 This module is mounted into the backend container and can be run either by the
-API process or from a short-lived container. It creates one system universe per
-industry/concept and stores the current constituent snapshot as membership.
+API process or from a short-lived container. It creates one system tag per
+industry/concept (``qd_symbol_tags``, category ``industry``/``concept``) and
+stores the current constituent snapshot in ``qd_symbol_tag_members``.
+
+Tags replaced universes here on purpose: a sector is a label used for screening
+and per-symbol annotation, while a universe is a strategy input. Keeping sectors
+out of ``qd_universes`` removes 710 entries from the universe picker without
+losing the membership data.
 
 The source endpoint returns present-day constituents, not point-in-time
-membership. Each universe therefore carries ``snapshot_only`` and
-``snapshot_as_of`` metadata so the backtest readiness check prevents accidental
-historical use.
+membership, so each tag is ``point_in_time = FALSE`` with the snapshot date in
+``metadata_json.snapshot_as_of``; ``tag_conditions_floor`` uses it to pin a
+smart universe (and therefore any backtest) to the snapshot date.
 """
 
 from __future__ import annotations
@@ -35,15 +41,15 @@ logger = get_logger(__name__)
 SOURCE = "hithink_finance"
 SOURCE_NAME = "HiThink Financial API"
 SYSTEM_MARKET = "CNStock"
-UNIVERSE_TYPE = "market"
 
 DEFAULT_BASE_URL = "https://fuyao.aicubes.cn"
 CATALOG_PATH = "/api/a-share-index/catalog/ths-index-list"
 CONSTITUENTS_PATH = "/api/a-share-index/constituents/ths-stock-list"
 
+# CLI tag -> (code prefix, category, display label, sort order base)
 TAGS = {
-    "industry": ("cn_industry", "Industry"),
-    "cn_concept": ("cn_concept", "Concept"),
+    "industry": ("cn_industry", "industry", "Industry", 0),
+    "cn_concept": ("cn_concept", "concept", "Concept", 1000),
 }
 
 _CODE_RE = re.compile(r"[^a-z0-9]+")
@@ -139,42 +145,37 @@ def fetch_constituents(thscode: str) -> list[dict[str, Any]]:
     return output
 
 
-def _universe_code(prefix: str, thscode: str) -> str:
+def _tag_code(prefix: str, thscode: str) -> str:
     suffix = _CODE_RE.sub("_", thscode.lower()).strip("_")
     return f"{prefix}_{suffix}"[:80]
 
 
-def _replace_members(cur: Any, universe_id: int, members: list[dict[str, Any]]) -> None:
+def _replace_members(cur: Any, tag_id: int, members: list[dict[str, Any]], as_of: date) -> None:
+    """Swap one tag's membership wholesale (the snapshot is present-day only)."""
     cur.execute(
-        "DELETE FROM qd_universe_members WHERE universe_id = ?",
-        (int(universe_id),),
+        "DELETE FROM qd_symbol_tag_members WHERE tag_id = ?",
+        (int(tag_id),),
     )
     for member in members:
         cur.execute(
             """
-            INSERT INTO qd_universe_members
-              (universe_id, market, symbol, name, exchange_id, market_type,
-               instrument_id, settle_currency, valid_from, valid_to,
-               member_weight, member_rank, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?::jsonb)
+            INSERT INTO qd_symbol_tag_members
+              (tag_id, market, symbol, name, as_of_date, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?::jsonb)
+            ON CONFLICT (tag_id, market, symbol) DO NOTHING
             """,
             (
-                int(universe_id),
+                int(tag_id),
                 member["market"],
                 member["symbol"],
                 member["name"],
-                member["exchange_id"],
-                member["market_type"],
-                member["instrument_id"],
-                member["settle_currency"],
-                date(1900, 1, 1),
-                member.get("rank"),
+                as_of,
                 json.dumps(member.get("metadata") or {}, ensure_ascii=False),
             ),
         )
 
 
-def upsert_universe(
+def upsert_tag(
     *,
     tag: str,
     thscode: str,
@@ -182,8 +183,8 @@ def upsert_universe(
     members: list[dict[str, Any]],
     as_of: date,
 ) -> dict[str, Any]:
-    prefix, label = TAGS[tag]
-    code = _universe_code(prefix, thscode)
+    prefix, category, label, order = TAGS[tag]
+    code = _tag_code(prefix, thscode)
     name = f"{label}: {display_name}"
     metadata = {
         "source": SOURCE,
@@ -199,19 +200,15 @@ def upsert_universe(
         cur = db.cursor()
         cur.execute(
             """
-            INSERT INTO qd_universes
-              (user_id, code, name, name_i18n_key, market, universe_type,
-               source, source_ref, is_system, status, metadata_json)
-            VALUES
-              (NULL, ?, ?, '', 'CNStock', 'market', ?, ?, TRUE, 'active', ?::jsonb)
-            ON CONFLICT (code) WHERE is_system = TRUE
-            DO UPDATE SET
-              user_id = NULL,
+            INSERT INTO qd_symbol_tags
+              (code, name, category, market, source, is_system, status,
+               sort_order, point_in_time, metadata_json)
+            VALUES (?, ?, ?, 'CNStock', ?, TRUE, 'active', ?, FALSE, ?::jsonb)
+            ON CONFLICT (code) DO UPDATE SET
               name = EXCLUDED.name,
+              category = EXCLUDED.category,
               market = EXCLUDED.market,
-              universe_type = EXCLUDED.universe_type,
               source = EXCLUDED.source,
-              source_ref = EXCLUDED.source_ref,
               status = EXCLUDED.status,
               metadata_json = EXCLUDED.metadata_json,
               updated_at = NOW()
@@ -220,23 +217,26 @@ def upsert_universe(
             (
                 code,
                 name,
+                category,
                 SOURCE,
-                thscode,
+                order,
                 json.dumps(metadata, ensure_ascii=False),
             ),
         )
         row = cur.fetchone() or {}
-        universe_id = int(row.get("id") or 0)
-        if not universe_id:
-            raise SectorSyncError(f"failed to upsert universe {code}")
-        _replace_members(cur, universe_id, members)
+        tag_id = int(row.get("id") or 0)
+        if not tag_id:
+            raise SectorSyncError(f"failed to upsert tag {code}")
+        _replace_members(cur, tag_id, members, as_of)
         db.commit()
         cur.close()
     return {
-        "universe_id": universe_id,
+        "tag_id": tag_id,
         "code": code,
         "name": name,
+        "category": category,
         "thscode": thscode,
+        "as_of": as_of.isoformat(),
         "members": len(members),
     }
 
@@ -288,13 +288,13 @@ def sync(
                     raise SectorSyncError("empty constituent list")
                 if dry_run:
                     results.append({
-                        "code": _universe_code(TAGS[tag][0], thscode),
+                        "code": _tag_code(TAGS[tag][0], thscode),
                         "name": f"{TAGS[tag][1]}: {name}",
                         "thscode": thscode,
                         "members": len(members),
                     })
                 else:
-                    results.append(upsert_universe(
+                    results.append(upsert_tag(
                         tag=tag,
                         thscode=thscode,
                         display_name=name,
@@ -324,7 +324,7 @@ def sync(
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync THS industry/concept universes from HiThink Financial API"
+        description="Sync THS industry/concept tags from HiThink Financial API"
     )
     parser.add_argument(
         "--tag",

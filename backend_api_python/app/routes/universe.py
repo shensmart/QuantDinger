@@ -36,14 +36,31 @@ def create_universe():
     try:
         payload = request.get_json(silent=True) or {}
         universe_type = str(payload.get("universe_type") or payload.get("universeType") or "manual")
-        if universe_type != "manual":
-            raise UniverseError("universe.createTypeUnsupported")
-        return _success(get_universe_service().create_manual(g.user_id, payload), status=201)
+        service = get_universe_service()
+        if universe_type == "manual":
+            return _success(service.create_manual(g.user_id, payload), status=201)
+        if universe_type == "smart":
+            return _success(service.create_smart(g.user_id, payload), status=201)
+        raise UniverseError("universe.createTypeUnsupported")
     except UniverseError as exc:
         return _failure(exc)
     except Exception:
         logger.exception("create universe failed")
         return jsonify({"code": 0, "msg": "universe.createFailed", "data": None}), 500
+
+
+@universe_blp.route("/<int:universe_id>", methods=["PUT"])
+@login_required
+def update_universe(universe_id: int):
+    """Update a smart universe's name/conditions (manual pools edit members)."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        return _success(get_universe_service().update_smart(g.user_id, universe_id, payload))
+    except UniverseError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("update universe failed")
+        return jsonify({"code": 0, "msg": "universe.updateFailed", "data": None}), 500
 
 
 @universe_blp.route("/<int:universe_id>/clone", methods=["POST"])

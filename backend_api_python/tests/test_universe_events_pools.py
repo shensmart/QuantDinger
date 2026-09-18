@@ -1,64 +1,29 @@
 """System event pools and the backfill driver."""
 import datetime as dt
+import pathlib
 
 from app.services import events_data, hithink_events_sync
 
 
-def test_pool_definitions_cover_the_four_boards():
-    codes = {item[0] for item in hithink_events_sync.UNIVERSE_POOLS}
-    assert codes == {
-        "hithink_limit_up",
-        "hithink_limit_up_ladder",
-        "hithink_dragon_tiger",
-        "hithink_hot_rank",
+def test_event_tags_cover_the_boards():
+    """Boards are event tags now, mapped to qd_market_events.event_type."""
+    from app.services.symbol_tags import CATEGORIES
+
+    expected = {
+        "event_limit_up": ["limit_up"],
+        "event_limit_down": ["limit_down"],
+        "event_limit_break": ["limit_break"],
+        "event_limit_up_ladder": ["limit_up_ladder"],
+        "event_hot_rank": ["hot_rank"],
     }
-    assert all(item[2] in events_data.EVENT_TYPES for item in hithink_events_sync.UNIVERSE_POOLS)
-
-
-def test_refresh_pools_marks_snapshot_only_and_sets_history_from(monkeypatch):
-    captured = []
-
-    class _FakeService:
-        def upsert_system_universe(self, **kwargs):
-            captured.append(kwargs)
-            return {"code": kwargs["code"], "members": len(kwargs["members"])}
-
-    monkeypatch.setattr("app.services.universe.UniverseService", _FakeService)
-    monkeypatch.setattr(
-        events_data,
-        "query_events",
-        lambda **kwargs: {
-            "items": [
-                {"market": "CNStock", "symbol": "600519.SH", "name": "贵州茅台", "rank": 1},
-                {"market": "CNStock", "symbol": "000001.SZ", "name": "平安银行", "rank": 2},
-            ],
-            "total": 2,
-        },
-    )
-    monkeypatch.setattr(hithink_events_sync, "_earliest_event_date", lambda: dt.date(2026, 9, 1))
-
-    day = dt.date(2026, 9, 16)
-    report = hithink_events_sync.refresh_universe_pools(day)
-
-    assert report["failures"] == []
-    assert len(captured) == 4
-    for call in captured:
-        assert call["metadata"]["snapshot_only"] is True
-        assert call["metadata"]["snapshot_as_of"] == "2026-09-01"
-        assert call["valid_from"] == dt.date(2026, 9, 1)
-        assert len(call["members"]) == 2
-
-
-def test_history_from_is_clamped_to_the_backfill_window(monkeypatch):
-    monkeypatch.setenv("HITHINK_EVENTS_BACKFILL_DAYS", "30")
-    monkeypatch.setattr(hithink_events_sync, "_earliest_event_date", lambda: dt.date(2020, 1, 1))
-    assert hithink_events_sync._pool_history_from(dt.date(2026, 9, 16)) == dt.date(2026, 8, 17)
-
-
-def test_history_from_uses_stored_events_when_they_are_newer(monkeypatch):
-    monkeypatch.setenv("HITHINK_EVENTS_BACKFILL_DAYS", "365")
-    monkeypatch.setattr(hithink_events_sync, "_earliest_event_date", lambda: dt.date(2026, 9, 1))
-    assert hithink_events_sync._pool_history_from(dt.date(2026, 9, 16)) == dt.date(2026, 9, 1)
+    migration = (pathlib.Path(__file__).resolve().parent.parent
+                 / "migrations" / "20260918_symbol_tags.sql").read_text()
+    for code, event_types in expected.items():
+        assert f"'{code}'" in migration
+        for event_type in event_types:
+            assert f'"{event_type}"' in migration
+    assert "event" in CATEGORIES
+    assert all(item in events_data.EVENT_TYPES for item in ("limit_up", "limit_up_ladder", "hot_rank"))
 
 
 def test_due_now_requires_close_time_trading_day_and_missing_rows(monkeypatch):

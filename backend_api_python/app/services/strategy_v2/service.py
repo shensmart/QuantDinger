@@ -412,6 +412,10 @@ class StrategyV2BacktestService:
             return [_instrument_member(item) for item in manifest.universe.instruments], None
 
         reference = manifest.universe.reference
+        if str(reference or "").upper().startswith("TAG:"):
+            # ``TAG:<code>`` is the single-tag shortcut; a saved smart pool
+            # (``POOL:<code>``) is the same machinery with stored conditions.
+            return self._tag_candidates(reference, start_date, end_date), None
         universe = next((item for item in self.universe_service.list_universes(user_id) if _universe_matches(item, reference)), None)
         if not universe:
             raise StrategyV2ContractError(f"strategyV2.universeNotFound:{reference}")
@@ -427,6 +431,60 @@ class StrategyV2BacktestService:
         if len(members) > limit:
             raise StrategyV2ContractError("strategyV2.universeTooLarge")
         return [{**item, "key": _member_key(item)} for item in members], universe_id
+
+    def _tag_candidates(
+        self,
+        reference: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> list[dict[str, Any]]:
+        """Resolve ``TAG:<code>`` over the backtest window.
+
+        A snapshot-only tag (industry/concept/quote) cannot answer for a past
+        date, so a backtest starting before its snapshot is rejected exactly
+        like a snapshot-only universe.
+        """
+        from app.services.symbol_tags import SymbolTagError, get_symbol_tag_service
+
+        code = str(reference).split(":", 1)[1].strip().lower()
+        service = get_symbol_tag_service()
+        try:
+            tag = service.get_tag(code)
+        except SymbolTagError as exc:
+            raise StrategyV2ContractError(f"strategyV2.universeNotFound:{reference}") from exc
+        if not tag.get("point_in_time"):
+            earliest = str(tag.get("as_of_date") or "")
+            if earliest and start_date.date() < pd.Timestamp(earliest).date():
+                raise StrategyV2ContractError(
+                    f"strategyV2.universeHistoryUnavailable:{code}:{earliest}"
+                )
+        try:
+            result = service.screen(
+                [{"tag_code": code}],
+                as_of=end_date.date(),
+                date_range=[start_date.date(), end_date.date()],
+                limit=max(1, int(os.getenv("STRATEGY_V2_MAX_SYMBOLS", "600") or 600)),
+                with_quotes=False,
+            )
+        except SymbolTagError as exc:
+            raise StrategyV2ContractError(f"strategyV2.universeNotFound:{reference}") from exc
+        limit = max(1, int(os.getenv("STRATEGY_V2_MAX_SYMBOLS", "600") or 600))
+        if result["total"] > limit:
+            raise StrategyV2ContractError("strategyV2.universeTooLarge")
+        members = [
+            {
+                "market": item["market"],
+                "symbol": item["symbol"],
+                "name": item.get("name") or "",
+                "exchange_id": "",
+                "market_type": "spot",
+                "instrument_id": "",
+                "settle_currency": "",
+                "metadata": {"tags": item.get("tags") or []},
+            }
+            for item in result["items"]
+        ]
+        return [{**item, "key": _member_key(item)} for item in members]
 
     def fetch_frames(
         self,

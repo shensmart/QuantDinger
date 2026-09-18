@@ -24,6 +24,7 @@ QUICK_TRADE = "QuickTrade"
 MARKET_EVENTS = "MarketEvents"
 IBKR = "IBKR"
 ALPACA = "Alpaca"
+SYMBOL_TAGS = "SymbolTags"
 
 ALL_TAGS = [
     {"name": HEALTH, "description": "Liveness and API metadata (Public)"},
@@ -50,4 +51,5 @@ ALL_TAGS = [
     {"name": MARKET_EVENTS, "description": "A-share market event boards (Internal)"},
     {"name": IBKR, "description": "Interactive Brokers adapter (Internal)"},
     {"name": ALPACA, "description": "Alpaca adapter (Internal)"},
+    {"name": SYMBOL_TAGS, "description": "Symbol tags, screening, and smart pools (Internal)"},
 ]

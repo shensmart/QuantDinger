@@ -47,7 +47,7 @@ def test_resume_skips_dates_that_already_have_every_requested_type(monkeypatch, 
         return {"trade_date": day.isoformat(), "results": [], "failures": [], "written": 0}
 
     monkeypatch.setattr(events_data, "sync_date", fake_sync)
-    backfill.main(["--resume", "--days", "5", "--only", "limit_up", "--only", "hot_rank", "--skip-universes"])
+    backfill.main(["--resume", "--days", "5", "--only", "limit_up", "--only", "hot_rank"])
     assert synced == [dt.date(2026, 9, 16)]
 
 
@@ -66,7 +66,7 @@ def test_partial_coverage_is_re_fetched(monkeypatch, capsys):
         return {"trade_date": day.isoformat(), "results": [], "failures": [], "written": 0}
 
     monkeypatch.setattr(events_data, "sync_date", fake_sync)
-    backfill.main(["--resume", "--only", "limit_up", "--only", "hot_rank", "--skip-universes"])
+    backfill.main(["--resume", "--only", "limit_up", "--only", "hot_rank"])
     assert synced == [dt.date(2026, 9, 15)]
 
 
@@ -83,7 +83,7 @@ def test_provider_failure_is_reported_without_aborting_the_run(monkeypatch, caps
     monkeypatch.setattr(
         backfill, "_target_dates", lambda days, only=None: [dt.date(2026, 9, 15), dt.date(2026, 9, 16)]
     )
-    code = backfill.main(["--only", "limit_up", "--only", "hot_rank", "--skip-universes"])
+    code = backfill.main(["--only", "limit_up", "--only", "hot_rank"])
     out = capsys.readouterr().out
     assert '"failures": 2' in out
     assert code == 0, "a partial failure must not fail the whole backfill"
@@ -124,7 +124,7 @@ def test_limit_days_takes_the_newest_dates(monkeypatch, capsys):
         return {"trade_date": day.isoformat(), "results": [], "failures": [], "written": 0}
 
     monkeypatch.setattr(events_data, "sync_date", fake_sync)
-    backfill.main(["--limit-days", "2", "--only", "limit_up", "--skip-universes"])
+    backfill.main(["--limit-days", "2", "--only", "limit_up"])
     # --limit-days is a smoke-run switch: it keeps the OLDEST dates so a small
     # window still exercises the historical path.
     assert synced == [dt.date(2026, 9, 10), dt.date(2026, 9, 11)]
