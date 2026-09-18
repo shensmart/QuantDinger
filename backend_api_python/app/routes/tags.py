@@ -4,12 +4,14 @@ from flask import g, jsonify, request
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.services.symbol_tags import (
+    CATEGORIES,
     MATERIALIZED_CATEGORIES,
     SymbolTagError,
     get_symbol_tag_service,
     normalize_conditions,
     tag_conditions_floor,
 )
+from app.services.tag_hierarchy import build_groups
 from app.services.universe import UniverseError, get_universe_service
 from app.utils.auth import admin_required, login_required
 from app.utils.logger import get_logger
@@ -139,29 +141,46 @@ def save_screen():
 @tags_blp.route("/symbols", methods=["GET"])
 @login_required
 def symbols_tags():
-    """Batch tag lookup for lists (watchlist, search results).
+    """Batch tag lookup for lists (watchlist, search results, board rows).
 
-    One request per screen instead of one per row: a 200-symbol watchlist would
-    otherwise issue 200 round trips just to render tag chips.
+    One query for the whole list: a 200-symbol watchlist would otherwise issue
+    200 round trips just to render tag chips.
     """
     try:
         raw = request.args.get("symbols") or ""
-        symbols = [item.strip().upper() for item in raw.split(",") if item.strip()]
-        if not symbols:
-            raise SymbolTagError("symbolTag.symbolRequired")
-        if len(symbols) > 500:
-            raise SymbolTagError("symbolTag.tooManySymbols")
+        symbols = [item.strip() for item in raw.split(",") if item.strip()]
+        # No ``categories`` keeps the original all-categories response, so the
+        # quick-trade picker (which wants event tags too) needs no change.
+        categories = (request.args.get("categories") or ",".join(CATEGORIES)).split(",")
         market = request.args.get("market") or "CNStock"
-        service = get_symbol_tag_service()
         return _success({
             "market": market,
-            "items": {symbol: service.tags_for_symbol(market, symbol) for symbol in symbols},
+            "items": get_symbol_tag_service().symbols_tags_batch(market, symbols, categories),
         })
     except SymbolTagError as exc:
         return _failure(exc)
     except Exception:
         logger.exception("batch symbol tags failed")
         return jsonify({"code": 0, "msg": "symbolTag.symbolFailed", "data": None}), 500
+
+
+@tags_blp.route("/hierarchy", methods=["GET"])
+@login_required
+def tag_hierarchy():
+    """Group a board's rows by industry/concept, for the grouped and tree views."""
+    try:
+        raw = request.args.get("symbols") or ""
+        payload = build_groups(
+            request.args.get("market") or "CNStock",
+            [item.strip() for item in raw.split(",") if item.strip()],
+            (request.args.get("categories") or "industry,concept").split(","),
+        )
+        return _success(payload)
+    except SymbolTagError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("tag hierarchy failed")
+        return jsonify({"code": 0, "msg": "symbolTag.hierarchyFailed", "data": None}), 500
 
 
 @tags_blp.route("/symbols/<string:symbol>", methods=["GET"])

@@ -52,6 +52,11 @@ TAGS = {
     "cn_concept": ("cn_concept", "concept", "Concept", 1000),
 }
 
+# Candidate field names for an upstream parent link. The THS catalogue returns
+# only thscode/name today, so the industry tree is derived from member-set
+# inclusion in app/services/tag_hierarchy.py instead; this probe exists only to
+# record the fact, so a future upstream field is noticed rather than guessed at.
+PARENT_FIELDS = ("parent_thscode", "parent_code", "parent", "pid")
 _CODE_RE = re.compile(r"[^a-z0-9]+")
 _THSCODE_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$", re.IGNORECASE)
 
@@ -101,6 +106,15 @@ def _request(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
 def fetch_catalog(tag: str) -> list[dict[str, str]]:
     payload = _request(CATALOG_PATH, {"tag": tag})
     items = ((payload.get("data") or {}).get("item") or [])
+    if items:
+        present = sorted({key for item in items for key in item})
+        parents = [name for name in PARENT_FIELDS if name in present]
+        logger.info(
+            "THS catalogue fields for tag=%s: %s; parent field: %s",
+            tag,
+            ",".join(present),
+            ",".join(parents) or "none (hierarchy is derived from member overlap)",
+        )
     output: list[dict[str, str]] = []
     for item in items:
         thscode = str(item.get("thscode") or "").strip().upper()

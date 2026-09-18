@@ -444,6 +444,104 @@ class SymbolTagService:
         return members
 
     # -- single symbol -----------------------------------------------------
+    def symbols_tags_batch(
+        self,
+        market: str,
+        symbols: Iterable[str],
+        categories: Iterable[str] = CATEGORIES,
+    ) -> dict[str, list[dict]]:
+        """Tags for many symbols in one round trip.
+
+        A 200-row board must not issue 200 queries: everything materialized
+        (industry/concept/quote) comes from one ``= ANY(?)`` join, and the
+        non-materialized event tags from one more. Both are independent of the
+        symbol count, which is the whole point of this method existing.
+        """
+        wanted_market = str(market or MARKET).strip() or MARKET
+        clean: list[str] = []
+        seen: set[str] = set()
+        for item in symbols or []:
+            symbol = str(item or "").strip().upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                clean.append(symbol)
+        if not clean:
+            raise SymbolTagError("symbolTag.symbolRequired")
+        if len(clean) > 500:
+            raise SymbolTagError("symbolTag.tooManySymbols")
+        wanted = [
+            name for name in CATEGORIES
+            if name in {str(item or "").strip().lower() for item in (categories or ())}
+        ]
+        if not wanted:
+            raise SymbolTagError("symbolTag.invalidCategory")
+        output: dict[str, list[dict]] = {symbol: [] for symbol in clean}
+        materialized = [name for name in wanted if name in MATERIALIZED_CATEGORIES]
+        with get_db_connection() as db:
+            cur = db.cursor()
+            if materialized:
+                cur.execute(
+                    """
+                    SELECT m.symbol, t.*, m.as_of_date
+                    FROM qd_symbol_tag_members m
+                    JOIN qd_symbol_tags t ON t.id = m.tag_id
+                    WHERE m.market = ? AND m.symbol = ANY(?) AND t.status <> 'deprecated'
+                      AND t.category = ANY(?)
+                    ORDER BY t.category, t.sort_order, t.code
+                    """,
+                    (wanted_market, clean, materialized),
+                )
+                for row in cur.fetchall() or []:
+                    symbol = str(row.get("symbol") or "").upper()
+                    if symbol in output:
+                        output[symbol].append(_serialize_tag(row))
+            if "event" in wanted:
+                for symbol, tag in self._event_tags_batch(cur, wanted_market, clean):
+                    if symbol in output:
+                        output[symbol].append(tag)
+            cur.close()
+        return output
+
+    @staticmethod
+    def _event_tags_batch(cur, market: str, symbols: list[str]) -> list[tuple[str, dict]]:
+        """``[(symbol, tag)]`` for every event tag any of ``symbols`` has ever hit.
+
+        One query for the whole list: ``qd_market_events`` is point-in-time, so
+        the join goes through each tag's ``rule_json.event_types`` instead of a
+        stored membership row.
+        """
+        cur.execute(
+            """
+            SELECT e.symbol, t.*, MAX(e.trade_date) AS last_trade_date
+            FROM qd_symbol_tags t
+            JOIN qd_market_events e
+              ON e.market = t.market
+             AND e.available_at <= NOW()
+             AND e.event_type = ANY(
+                   SELECT jsonb_array_elements_text(t.rule_json -> 'event_types')
+                 )
+            WHERE t.category = 'event'
+              AND t.status <> 'deprecated'
+              AND t.market = ?
+              AND e.symbol = ANY(?)
+            GROUP BY t.id, e.symbol
+            ORDER BY t.sort_order, t.code
+            """,
+            (market, symbols),
+        )
+        output: list[tuple[str, dict]] = []
+        seen: set[tuple[str, int]] = set()
+        for row in cur.fetchall() or []:
+            symbol = str(row.get("symbol") or "").upper()
+            key = (symbol, int(row.get("id") or 0))
+            if not symbol or key in seen:
+                continue
+            seen.add(key)
+            tag = _serialize_tag(row)
+            tag["as_of_date"] = _iso(row.get("last_trade_date"))
+            output.append((symbol, tag))
+        return output
+
     def tags_for_symbol(self, market: str, symbol: str) -> list[dict]:
         wanted_market = str(market or MARKET).strip() or MARKET
         wanted_symbol = str(symbol or "").strip().upper()
