@@ -730,21 +730,47 @@ def aggregate_weekly(klines: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def valuations(thscodes: Iterable[str]) -> Dict[str, dict]:
-    """Valuation snapshot keyed by project symbol."""
+    """Valuation snapshot keyed by project symbol.
+
+    The endpoint rejects a whole batch when any thscode is unknown (code=3001,
+    e.g. delisted names), so a failing batch is split in half until the bad code
+    is isolated. Without this, one stale universe member blanks valuation for the
+    other 99 symbols sharing its batch.
+    """
     codes = [to_thscode(item) for item in thscodes]
     codes = [code for code in codes if code]
     output: Dict[str, dict] = {}
     for batch in _chunks(codes, 100):
+        for item in _valuation_batch(batch):
+            symbol = to_project_symbol(str(item.get("thscode") or ""))
+            if symbol:
+                output[symbol] = item
+    return output
+
+
+def _valuation_batch(batch: List[str]) -> List[dict]:
+    """Fetch one batch, bisecting on the provider's whole-batch rejection."""
+    if not batch:
+        return []
+    try:
         data = _request(
             "/api/a-share/valuations/snapshot",
             {"thscodes": ",".join(batch)},
             ttl=TTL_VALUATION,
         )
-        for item in _items(data):
-            symbol = to_project_symbol(str(item.get("thscode") or ""))
-            if symbol:
-                output[symbol] = item
-    return output
+    except (HiThinkParamError, HiThinkError) as exc:
+        # Unknown thscodes surface as code=3001 (generic HiThinkError), while
+        # malformed requests use code=1002 (HiThinkParamError). Both mean "this
+        # batch is not answerable as-is", so isolate the offender. Rate limiting
+        # and provider outages must propagate instead of being bisected.
+        if isinstance(exc, (HiThinkRateLimited, HiThinkUnavailable, HiThinkUnauthorized, HiThinkForbidden)):
+            raise
+        if len(batch) == 1:
+            logger.debug("HiThink valuations: skipping unknown thscode %s", batch[0])
+            return []
+        middle = len(batch) // 2
+        return _valuation_batch(batch[:middle]) + _valuation_batch(batch[middle:])
+    return _items(data)
 
 
 def _statements(path: str, symbol: str, *, period: str = "quarterly", limit: int = 8) -> List[dict]:

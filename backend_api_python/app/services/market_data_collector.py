@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 
 from app.data_sources import DataSourceFactory
+from app.services.fundamental_data import FUNDAMENTAL_FIELDS
 from app.services.kline import KlineService
 from app.services.market.technical_indicators import calculate_indicators
 from app.utils.logger import get_logger
@@ -49,6 +50,34 @@ def _num(value: Any) -> Optional[float]:
     if number != number or number in (float("inf"), float("-inf")):
         return None
     return number
+
+
+def _apply_tencent_quote_fundamentals(result: Dict[str, Any], parts: Any) -> bool:
+    """Fill valuation, share count and market cap from an already-fetched Tencent quote.
+
+    Tencent exposes PE, PB and total market cap for every A-share including the
+    Beijing Stock Exchange, where HiThink returns neither. Reusing the quote the
+    caller already fetched avoids a second AkShare round trip per symbol.
+    Returns True when nothing more is needed from the slow fallback tiers.
+    """
+    if not parts or len(parts) <= 46:
+        return False
+    pe = _num(parts[39])
+    pb = _num(parts[46])
+    market_cap_yi = _num(parts[45])
+    price = _num(parts[3])
+    if result.get("pe_ratio") is None and pe is not None:
+        result["pe_ratio"] = pe
+    if result.get("pb_ratio") is None and pb is not None:
+        result["pb_ratio"] = pb
+    if result.get("market_cap") is None and market_cap_yi is not None:
+        result["market_cap"] = market_cap_yi * 100_000_000
+    if result.get("shares_outstanding") is None and market_cap_yi is not None and price:
+        # Market cap in 亿元 divided by price keeps share count and market cap
+        # internally consistent when no statement source reports the shares.
+        result["shares_outstanding"] = round(market_cap_yi * 100_000_000 / price, 0)
+    return all(result.get(key) is not None for key in ("pe_ratio", "pb_ratio", "shares_outstanding"))
+
 
 logger = get_logger(__name__)
 
@@ -660,21 +689,41 @@ class MarketDataCollector:
         indicators = {}
         report_date = output.get("period_end")
         if hasattr(report_date, "year"):
-            indicators = hithink.financial_indicators(symbol, hithink.report_period(report_date))
-        if indicators.get("index_weighted_avg_roe") is not None:
-            output["return_on_equity"] = indicators["index_weighted_avg_roe"]
-            output["roe"] = indicators["index_weighted_avg_roe"]
-        if indicators.get("operating_income_yoy_growth_ratio") is not None:
+            try:
+                indicators = hithink.financial_indicators(symbol, hithink.report_period(report_date))
+            except Exception as e:
+                logger.debug("HiThink indicators failed %s: %s", symbol, e)
+        roe = None
+        for key in ("index_weighted_avg_roe", "index_deduct_weighted_avg_roe"):
+            if _num(indicators.get(key)) is not None:
+                roe = _num(indicators.get(key))
+                break
+        if roe is not None:
+            output["return_on_equity"] = roe
+            output["roe"] = roe
+        if indicators.get("calculate_operating_income_yoy_growth_ratio") is not None:
+            output["revenue_growth"] = indicators["calculate_operating_income_yoy_growth_ratio"]
+        elif indicators.get("operating_income_yoy_growth_ratio") is not None:
             output["revenue_growth"] = indicators["operating_income_yoy_growth_ratio"]
         if indicators.get("assets_debt_ratio") is not None:
             equity = _num(latest_balance.get("holder_equity_total"))
             debt = _num(latest_balance.get("total_debt"))
-            if equity:
+            if equity and equity > 0:
                 output["debt_to_equity"] = round(debt / equity, 4) if debt is not None else None
         if indicators.get("current_ratio") is not None:
             output["current_ratio"] = indicators["current_ratio"]
         if indicators.get("sale_net_interest_ratio") is not None:
             output["profit_margin"] = indicators["sale_net_interest_ratio"]
+
+        # ROE fallback: TTM net income over reported equity. Only meaningful when
+        # equity is positive; negative-equity companies have no meaningful ROE and
+        # must stay NULL rather than publish a sign-flipped ratio.
+        if output.get("return_on_equity") is None:
+            net_ttm = _num(output.get("net_income_ttm"))
+            equity = _num(output.get("shareholder_equity"))
+            if net_ttm is not None and equity is not None and equity > 0:
+                output["return_on_equity"] = round(net_ttm / equity * 100, 4)
+                output["roe"] = output["return_on_equity"]
 
         if not output:
             return {}
@@ -828,18 +877,16 @@ class MarketDataCollector:
                     if v is not None and result.get(k) is None:
                         result[k] = v
 
-            # Tier 2: AkShare valuation (fill any remaining None fields)
-            has_valuation = result.get("pe_ratio") is not None or result.get("pb_ratio") is not None
-            if not has_valuation:
+            # Tier 2: AkShare valuation. Only when the Tencent quote could not already
+            # supply valuation, so HiThink-covered A-shares skip these slow calls.
+            if not _apply_tencent_quote_fundamentals(result, parts):
                 try:
                     ak_data = fetch_cn_fundamental_akshare(code) if not is_hk else fetch_hk_fundamental_akshare(code)
                 except Exception as e:
                     logger.debug("AkShare CN/HK fundamental failed %s:%s: %s", market, symbol, e)
                     ak_data = {}
                 if ak_data:
-                    if "twelvedata" not in result.get("source", ""):
-                        result["source"] = "tencent_quote+akshare_em"
-                    else:
+                    if "akshare" not in str(result.get("source") or ""):
                         result["source"] += "+akshare_em"
                     for k, v in ak_data.items():
                         if k == "source":
@@ -913,7 +960,20 @@ class MarketDataCollector:
                 except Exception as e:
                     logger.debug("TwelveData earnings failed %s:%s: %s", market, symbol, e)
 
-            self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=is_hk)
+            # Derive per-share book value before deciding whether Yahoo is needed:
+            # BJ shares get total equity from HiThink but no share count, and the
+            # shares come from the Tencent quote, so this must run first.
+            if result.get("book_value") is None:
+                equity = result.get("shareholder_equity")
+                shares = result.get("shares_outstanding")
+                if equity is not None and shares:
+                    result["book_value"] = round(float(equity) / float(shares), 4)
+
+            # Yahoo is a ~6s/symbol fallback. Skip it when every canonical field is
+            # already present from the domestic chain, which is the common case now
+            # that HiThink is the A-share primary source.
+            if any(result.get(field) is None for field in FUNDAMENTAL_FIELDS):
+                self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=is_hk)
 
             # Fallback: build earnings from financial_statements if /earnings failed
             if "earnings" not in result and "financial_statements" in result:

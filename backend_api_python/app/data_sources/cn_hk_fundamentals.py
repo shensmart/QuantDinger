@@ -386,8 +386,11 @@ def _eastmoney_a_em_symbol(tencent_code: str) -> str:
 
 
 def _apply_tencent_valuation_fallback(result: Dict[str, Any], tencent_code: str) -> None:
-    """Fill valuation fields from Tencent when Eastmoney/Yahoo are unavailable."""
-    if all(result.get(key) is not None for key in ("pe_ratio", "pb_ratio", "market_cap")):
+    """Fill valuation and share-count fields from Tencent when other sources are unavailable."""
+    if all(
+        result.get(key) is not None
+        for key in ("pe_ratio", "pb_ratio", "market_cap", "shares_outstanding")
+    ):
         return
     try:
         parts = fetch_quote(tencent_code)
@@ -409,6 +412,14 @@ def _apply_tencent_valuation_fallback(result: Dict[str, Any], tencent_code: str)
         result["float_market_cap"] = float_market_cap_yi * 100_000_000
     if result.get("market_cap") is None and market_cap_yi is not None:
         result["market_cap"] = market_cap_yi * 100_000_000
+
+    # Tencent reports total market cap in 亿元; derived share count keeps the
+    # share count and market cap internally consistent even when the statement
+    # sources (BJ/HK) expose neither.
+    if result.get("shares_outstanding") is None:
+        price = _float_clean(parts[3])
+        if price and market_cap_yi is not None:
+            result["shares_outstanding"] = round(market_cap_yi * 100_000_000 / price, 0)
 
 
 def _individual_info_map(symbol_6: str) -> Dict[str, Any]:
