@@ -68,6 +68,23 @@ python scripts/backfill_hithink_events.py --date 2026-09-16 --dry-run
 
 `qd_market_events` 的 `available_at` 固定为交易日 15:00（Asia/Shanghai），保证回测不会提前看到当日榜单。上游只保留一年榜单历史，回填窗口上限为 365 天。
 
+### 龙虎榜的东财式视图
+
+同花顺的 `dragon-tiger-list` 只给到「个股净买入 + 游资聚合」一层。要像东方财富数据中心龙虎榜那样看**每日活跃营业部**、**机构席位买卖**和**近一月/三月/六月/一年滚动统计**，走东财接口（经 AkShare），端点挂在 `/api/market-events/dragon-tiger/*`：
+
+| 端点 | 内容 |
+|---|---|
+| `GET /dragon-tiger/daily` | 当日全部上榜记录，含上榜原因、解读、换手率、流通市值 |
+| `GET /dragon-tiger/institutions` | 机构买卖情况：买/卖方机构数、机构买入额/卖出额/净额 |
+| `GET /dragon-tiger/branches` | 每日活跃营业部：买卖个股数、买卖总额、买入股票清单 |
+| `GET /dragon-tiger/statistics?window=近一月` | 个股龙虎榜统计（上榜次数、净买额、机构次数、区间涨跌幅） |
+| `GET /dragon-tiger/seat-tracking?window=近一月` | 机构席位买卖追踪 |
+| `GET /dragon-tiger/branch-ranking?window=近一月` | 证券营业部上榜统计 |
+
+`window` 只接受 `近一月 / 近三月 / 近六月 / 近一年`。数据不落库（东财只提供当前快照，没有时点语义），按 180 秒进程内缓存，失败时返回空列表并降级提示，不会 500。
+
+这两类数据的定位不同：`qd_market_events` 里的同花顺龙虎榜是**时点安全**的、可回测的；东财这批视图是**复盘展示**用的，不要写进策略。
+
 ---
 
 ## 4. 基本面数据
