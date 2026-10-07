@@ -124,6 +124,27 @@ def _bootstrap_database() -> None:
         logger.warning(f"Database initialization note: {e}")
 
 
+def _install_akshare_throttle() -> None:
+    """Throttle every AkShare HTTP call, in every process role.
+
+    AkShare's ~150 entry points each open their own ``requests`` call, and the
+    Chinese data hosts (notably Eastmoney's push2*) reset connections once a
+    client exceeds their tolerance — which used to make whole sync runs fail
+    permanently.  Patching ``HTTPAdapter.send`` covers all of them at once.
+
+    Failures are non-fatal: a missing throttle degrades data quality, it must
+    never stop the app from booting.
+    """
+    try:
+        from app.data_sources.rate_limiter import install_http_throttle
+
+        install_http_throttle()
+    except Exception as exc:  # pragma: no cover - defensive
+        from app.utils.logger import get_logger
+
+        get_logger(__name__).warning("AkShare throttle not installed: %s", exc)
+
+
 def create_app(config_name='default', *, register_http_routes: bool = True):
     """Create and configure the Flask application."""
     app = Flask(__name__)
@@ -145,6 +166,7 @@ def create_app(config_name='default', *, register_http_routes: bool = True):
 
     _configure_ibkr_asyncio()
     _bootstrap_database()
+    _install_akshare_throttle()
 
     if register_http_routes:
         from app.routes import register_routes

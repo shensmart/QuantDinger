@@ -49,6 +49,7 @@ celery_app.conf.update(
         "app.tasks.fundamental_sync",
         "app.tasks.hithink_events",
         "app.tasks.symbol_tags",
+        "app.tasks.chip_sync",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -62,6 +63,7 @@ celery_app.conf.update(
         "quantdinger.tasks.hithink_events_sync": {"queue": "maintenance"},
         "quantdinger.tasks.symbol_tag_tick": {"queue": "maintenance"},
         "quantdinger.tasks.symbol_tag_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.chip_sync_tick": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -103,6 +105,11 @@ celery_app.conf.update(
         "runtime-metadata-cleanup": {
             "task": "quantdinger.tasks.cleanup_runtime_metadata",
             "schedule": 86400.0,
+        },
+        # Chip distribution only changes after the close; one pass a day is plenty.
+        "chip-distribution-sync": {
+            "task": "quantdinger.tasks.chip_sync_tick",
+            "schedule": max(3600, int(os.getenv("CHIP_SYNC_INTERVAL_SEC", "86400"))),
         },
     },
 )

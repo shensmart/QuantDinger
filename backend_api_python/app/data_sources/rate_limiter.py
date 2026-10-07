@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
+import threading
 import time
 from functools import wraps
-from typing import Any, Callable, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 from app.utils.resource_guard import (
     is_fd_exhaustion,
@@ -195,3 +197,169 @@ def get_tencent_limiter() -> RateLimiter:
 def get_akshare_limiter() -> RateLimiter:
     """Return the AkShare rate limiter."""
     return _akshare_limiter
+
+
+# ---------------------------------------------------------------------------
+# Domain-level throttle for every outbound HTTP call made by AkShare.
+#
+# AkShare has ~150 entry points and each one opens its own ``requests`` call,
+# so wrapping individual call sites is both fragile and easy to miss.  Hooking
+# ``HTTPAdapter.send`` throttles all of them from one place, keyed by host, and
+# also normalises the browser-ish headers AkShare forgets to send.
+#
+# Rationale: Eastmoney's push2*/datacenter hosts close the connection without
+# response (``RemoteDisconnected``) once a client exceeds their tolerance,
+# which historically made whole sync runs fail permanently.  The intervals here
+# are deliberately conservative; they are env-tunable so operators can relax
+# them on an unfiltered egress without touching code.
+# ---------------------------------------------------------------------------
+
+# Requests per hour budget per host.  0 disables throttling for that host.
+_DEFAULT_THROTTLE: Dict[str, Tuple[float, int]] = {
+    "eastmoney.com": (1.2, 240),   # push2his / push2 / datacenter-web / data
+    "sina.com.cn": (0.4, 900),     # hq.sinajs.cn / finance.sina.com.cn
+    "sinajs.cn": (0.4, 900),
+    "10jqka.com.cn": (1.0, 300),   # Tonghuashun mirror
+    "xueqiu.com": (1.0, 300),
+}
+
+_THROTTLE_LOG_INTERVAL = 60.0
+_throttle_lock = threading.Lock()
+_throttle_states: Dict[str, dict] = {}
+_throttle_installed = False
+
+
+def _throttle_env_float(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+def throttle_settings() -> Tuple[bool, float]:
+    """Return ``(enabled, scale)`` for the outbound AkShare throttle.
+
+    ``AKSHARE_THROTTLE_ENABLED=false`` switches the throttle off.
+    ``AKSHARE_THROTTLE_SCALE`` multiplies every interval (``2`` = twice as slow).
+    """
+    raw = str(os.getenv("AKSHARE_THROTTLE_ENABLED") or "true").strip().lower()
+    enabled = raw not in {"0", "false", "no", "off"}
+    scale = _throttle_env_float("AKSHARE_THROTTLE_SCALE", 1.0) or 1.0
+    return enabled, scale
+
+
+def _host_budget(host: str) -> Optional[Tuple[float, int]]:
+    host = (host or "").lower()
+    if not host:
+        return None
+    for suffix, budget in _DEFAULT_THROTTLE.items():
+        if host == suffix or host.endswith("." + suffix):
+            return budget
+    return None
+
+
+def _throttle_wait(host: str) -> float:
+    """Sleep as required to respect this host's interval and hourly budget.
+
+    Returns the slept duration.  Caller must hold no lock.
+    """
+    enabled, scale = throttle_settings()
+    if not enabled:
+        return 0.0
+    budget = _host_budget(host)
+    if budget is None:
+        return 0.0
+    min_interval, hourly = budget
+    min_interval = min_interval * scale
+    if min_interval <= 0 and hourly <= 0:
+        return 0.0
+
+    slept = 0.0
+    while True:
+        with _throttle_lock:
+            now = time.time()
+            state = _throttle_states.setdefault(host, {"last": None, "stamps": []})
+            if min_interval > 0 and state["last"] is not None:
+                gap = min_interval - (now - state["last"])
+            else:
+                gap = 0.0
+            if gap > 0:
+                wait = min(gap, 5.0)
+            else:
+                # Prune to the trailing hour and enforce the hourly budget.
+                cutoff = now - 3600.0
+                stamps = [s for s in state["stamps"] if s > cutoff]
+                state["stamps"] = stamps
+                if hourly > 0 and len(stamps) >= hourly:
+                    wait = min(3600.0 - (now - stamps[0]) + 0.05, 30.0)
+                    wait = max(wait, 0.05)
+                else:
+                    state["last"] = now
+                    state["stamps"].append(now)
+                    return slept
+        time.sleep(wait)
+        slept += wait
+
+
+def install_http_throttle() -> bool:
+    """Throttle every ``requests`` call by target host.  Idempotent.
+
+    Must be called before AkShare traffic starts.  Safe to call from each
+    process role; each process installs its own patch.
+    """
+    global _throttle_installed
+    with _throttle_lock:
+        if _throttle_installed:
+            return True
+
+    try:
+        from requests.adapters import HTTPAdapter
+    except Exception as exc:  # pragma: no cover - requests always present
+        logger.warning("HTTP throttle not installed (no requests): %s", exc)
+        return False
+
+    original_send = HTTPAdapter.send
+    if getattr(original_send, "_qd_throttled", False):
+        with _throttle_lock:
+            _throttle_installed = True
+        return True
+
+    last_log = {"at": 0.0}
+
+    def throttled_send(self, request, **kwargs):
+        host = ""
+        try:
+            host = request.url.split("//", 1)[-1].split("/", 1)[0].split("@")[-1].split(":")[0]
+        except Exception:
+            host = ""
+        slept = _throttle_wait(host)
+        if slept >= 1.0:
+            now = time.time()
+            if now - last_log["at"] >= _THROTTLE_LOG_INTERVAL:
+                last_log["at"] = now
+                logger.info("Throttled AkShare request to %s by %.1fs", host, slept)
+        return original_send(self, request, **kwargs)
+
+    throttled_send._qd_throttled = True  # type: ignore[attr-defined]
+    HTTPAdapter.send = throttled_send  # type: ignore[assignment]
+    with _throttle_lock:
+        _throttle_installed = True
+    enabled, scale = throttle_settings()
+    logger.info("AkShare HTTP throttle installed (enabled=%s scale=%s)", enabled, scale)
+    return True
+
+
+def throttle_snapshot() -> Dict[str, Any]:
+    """Return per-host throttle counters for diagnostics."""
+    now = time.time()
+    with _throttle_lock:
+        return {
+            host: {
+                "last_ago_s": None if st["last"] is None else round(now - st["last"], 1),
+                "last_hour": len([s for s in st["stamps"] if s > now - 3600.0]),
+            }
+            for host, st in _throttle_states.items()
+        }
