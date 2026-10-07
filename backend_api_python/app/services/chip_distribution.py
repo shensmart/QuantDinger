@@ -11,6 +11,7 @@ Reference implementation: the ``CYQCalculator`` JS embedded in akshare's
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional, Sequence
 
 FACTOR = 150  # price-bucket resolution, hardcoded in the upstream JS
@@ -19,6 +20,16 @@ FACTOR = 150  # price-bucket resolution, hardcoded in the upstream JS
 def _to_fixed2(value: float) -> float:
     """Approximate JS ``Number.toFixed(2)`` for the values we return."""
     return float("%.2f" % (value,))
+
+
+def _to_precision12(value: float) -> float:
+    """Approximate JS ``Number.toPrecision(12)``.
+
+    The upstream JS rounds every chip bucket to 12 significant digits before
+    summing.  Skipping this drifts the totals by ~1e-4 on a 150-bucket
+    distribution, which is visible in the concentration ratios.
+    """
+    return float("%.12g" % (value,))
 
 
 def compute_chip_distribution(
@@ -75,11 +86,15 @@ def compute_chip_distribution(
         turnover = min(1.0, max(0.0, turnover))
         avg = (open_ + close + high + low) / 4.0
 
-        hi_idx = int((high - min_price) // accuracy)
-        lo_idx = int(-(-(low - min_price) // accuracy))  # ceil
+        # Mirror the JS exactly: both indices are (price - min) / accuracy with
+        # floor/ceil applied to the *quotient*.  Using integer floor-division
+        # here can differ from the JS by one bucket on float boundaries, which
+        # shifts chips between adjacent price levels.
+        hi_idx = int(math.floor((high - min_price) / accuracy))
+        lo_idx = int(math.ceil((low - min_price) / accuracy))
         # One-price bars (limit up/down) collapse to a single bucket.
         g_scale = (FACTOR - 1) if high == low else 2.0 / (high - low)
-        g_idx = int((avg - min_price) // accuracy)
+        g_idx = int(math.floor((avg - min_price) / accuracy))
         if not (0 <= g_idx < FACTOR):
             g_idx = min(max(g_idx, 0), FACTOR - 1)
 
@@ -102,16 +117,18 @@ def compute_chip_distribution(
                     weight = g_scale if abs(span) < 1e-8 else (high - cur) / span * g_scale
                 chips[j] += weight * turnover
 
-    total = sum(chips)
+    # Upstream rounds every bucket to 12 significant digits before summing.
+    rounded = [_to_precision12(c) for c in chips]
+    total = sum(rounded)
     if total <= 0:
         return None
 
     def cost_by_chip(target: float) -> float:
         acc = 0.0
         for i in range(FACTOR):
-            if acc + chips[i] > target:
+            if acc + rounded[i] > target:
                 return min_price + i * accuracy
-            acc += chips[i]
+            acc += rounded[i]
         return min_price + (FACTOR - 1) * accuracy
 
     def percent_chips(percent: float) -> Dict[str, float]:
@@ -119,6 +136,8 @@ def compute_chip_distribution(
         hi = cost_by_chip(total * (1 + percent) / 2.0)
         denom = lo + hi
         return {
+            # priceRange is toFixed(2) but concentration is derived from the
+            # UNROUNDED pair, exactly as the JS does.
             "low": _to_fixed2(lo),
             "high": _to_fixed2(hi),
             "concentration": 0.0 if denom == 0 else (hi - lo) / denom,
@@ -128,7 +147,7 @@ def compute_chip_distribution(
     below = 0.0
     for i in range(FACTOR):
         if current >= min_price + i * accuracy:
-            below += chips[i]
+            below += rounded[i]
 
     p90, p70 = percent_chips(0.9), percent_chips(0.7)
     return {

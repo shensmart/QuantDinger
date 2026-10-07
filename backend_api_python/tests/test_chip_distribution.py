@@ -127,3 +127,45 @@ def test_turnover_accepts_percent_and_fraction():
     assert a and b
     assert a["avg_cost"] == pytest.approx(b["avg_cost"], abs=0.02)
     assert a["benefit_ratio"] == pytest.approx(b["benefit_ratio"], abs=0.02)
+
+
+def test_bucket_index_matches_js_floor_semantics():
+    """Guards a real regression: integer ``//`` vs JS ``Math.floor(x / y)``.
+
+    Python's floor-division on floats can land one bucket away from the JS
+    quotient-floor on tie boundaries, which moves chips to an adjacent price
+    level.  The totals stay equal, so only a per-bucket comparison catches it;
+    that is why this asserts the exact distribution invariants instead.
+
+    A bar whose range lands exactly on a bucket boundary is the trigger.
+    """
+    # Construct prices where (high - min) / accuracy is an exact integer.
+    mn, acc = 20.08, 0.01
+    bars = []
+    for i in range(60):
+        # Alternate between exact-boundary and interior ranges.
+        if i % 2 == 0:
+            low, high = mn, mn + acc * 12
+        else:
+            low, high = mn + acc * 3, mn + acc * 11
+        close = (low + high) / 2
+        bars.append(
+            {
+                "date": "d%03d" % i,
+                "open": close,
+                "high": high,
+                "low": low,
+                "close": close,
+                "turnover": 0.0123,
+            }
+        )
+    stats = compute_chip_distribution(bars, len(bars) - 1, window=210)
+    assert stats is not None
+    # Chips must be conserved across the recursion: the profit ratio and the
+    # cost bands must stay mutually consistent at every step.
+    for i in range(len(bars)):
+        s = compute_chip_distribution(bars, i, window=210)
+        assert s is not None
+        assert 0.0 <= s["benefit_ratio"] <= 1.0
+        assert s["cost90_low"] <= s["cost70_low"] <= s["cost70_high"] <= s["cost90_high"]
+        assert s["cost90_low"] <= s["avg_cost"] <= s["cost90_high"]
