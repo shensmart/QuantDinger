@@ -55,36 +55,17 @@ def last_synced_trade_date() -> date | None:
     return dates.get("limit_up")
 
 
-def _is_working_day(day) -> bool:
-    """Trading-day check that tolerates a stale upstream calendar.
-
-    HiThink serves a rolling calendar that lags the current session (observed:
-    the last entry was 2026-09-30 while 2026-10-08 was a normal trading day).
-    Using ``is_trading_day`` alone silently skipped the event sync for over a
-    week.  A weekday past the calendar's last entry is therefore provisionally
-    treated as tradeable; the upstream board data itself is the real source of
-    truth and an empty response is harmless.
-
-    Mirrors ``symbol_tag_schedule._is_working_day``, which hit this first.
-    """
-    from app.data_sources import hithink_finance as hithink
-
-    if hithink.is_trading_day(day):
-        return True
-    if day.weekday() >= 5:
-        return False
-    try:
-        known = hithink.trading_days()
-    except Exception as exc:  # noqa: BLE001 - a calendar outage must not stop the tick
-        logger.warning("Trading calendar unavailable (%s); assuming weekdays are tradeable", exc)
-        return True
-    if not known:
-        return True
-    return day > max(known)
-
-
 def due_now(now=None) -> bool:
-    """True when today's boards are already published and not yet stored."""
+    """True when today's boards are already published and not yet stored.
+
+    Uses ``is_trading_day`` directly.  A previous version fell back to "weekday
+    past the calendar's last entry", on the theory that the upstream calendar
+    lagged.  It does not — the stale copy was ours: the calendar cache had a
+    fixed 24h TTL, so a copy fetched before the National Day holiday kept
+    serving its old end-date through the next session.  That is fixed at the
+    source (``trading_days`` now expires at local midnight), and guessing
+    weekdays would wrongly treat 2026-10-01..10-07 as tradeable.
+    """
     from app.data_sources import hithink_finance as hithink
 
     moment = now or hithink.shanghai_now()
@@ -92,7 +73,7 @@ def due_now(now=None) -> bool:
     if (moment.hour, moment.minute) < (hour, minute):
         return False
     today = moment.date()
-    if not _is_working_day(today):
+    if not hithink.is_trading_day(today):
         return False
     return last_synced_trade_date() != today
 

@@ -157,3 +157,67 @@ def test_trading_day_falls_back_to_weekday_when_calendar_fails(monkeypatch):
     monkeypatch.setattr(hithink, "trading_days", boom)
     assert hithink.is_trading_day(dt.date(2026, 9, 17)) is True  # Thursday
     assert hithink.is_trading_day(dt.date(2026, 9, 19)) is False  # Saturday
+
+
+# ---------------------------------------------------------------------------
+# Calendar cache lifetime
+#
+# The trading calendar is a rolling window upstream extends between sessions.
+# A fixed 24h TTL meant a copy fetched before the National Day holiday kept
+# serving its old end-date into the next session, so is_trading_day(today)
+# returned False and the event sync skipped real trading days
+# (2026-09-28..30 were missed this way).
+# ---------------------------------------------------------------------------
+
+
+def test_seconds_until_local_midnight_counts_to_next_shanghai_day():
+    tz = hithink.SHANGHAI_TZ
+    # 23:00 -> one hour left.
+    assert hithink.seconds_until_local_midnight(dt.datetime(2026, 10, 8, 23, 0, tzinfo=tz)) == 3600
+    # Just after midnight -> almost a full day.
+    assert hithink.seconds_until_local_midnight(dt.datetime(2026, 10, 8, 0, 0, 1, tzinfo=tz)) == 86399
+    # Naive input is treated as Shanghai time.
+    assert hithink.seconds_until_local_midnight(dt.datetime(2026, 10, 8, 12, 0)) == 43200
+    # Never returns 0 (a 0 TTL is falsy and would disable caching entirely).
+    assert hithink.seconds_until_local_midnight(dt.datetime(2026, 10, 8, 23, 59, 59, tzinfo=tz)) >= 1
+
+
+def test_seconds_until_local_midnight_normalizes_other_timezones():
+    """A UTC timestamp must convert to Shanghai time, not wrap wrongly."""
+    utc = dt.timezone.utc
+    # 2026-10-08 16:00 UTC == 2026-10-09 00:00 Shanghai -> full day ahead.
+    got = hithink.seconds_until_local_midnight(dt.datetime(2026, 10, 8, 16, 0, tzinfo=utc))
+    assert 86_000 <= got <= 86_400
+
+
+def test_calendar_ttl_never_outlives_the_local_day(monkeypatch):
+    """The cached calendar must expire at midnight, not a fixed day later."""
+    captured = {}
+
+    def fake_request(path, params=None, *, ttl=None):
+        captured["path"] = path
+        captured["ttl"] = ttl
+        return {"item": [{"date": "20261008"}]}
+
+    monkeypatch.setattr(hithink, "_request", fake_request)
+    monkeypatch.setattr(
+        hithink, "seconds_until_local_midnight",
+        lambda now=None: 1234,
+    )
+    days = hithink.trading_days()
+
+    assert captured["path"] == "/api/a-share/calendar/trading-days"
+    assert captured["ttl"] == 1234, "calendar must use the day-boundary TTL"
+    assert days == [dt.date(2026, 10, 8)]
+
+
+def test_calendar_ttl_is_capped_by_day_boundary_not_extended(monkeypatch):
+    """min(TTL_CALENDAR, until-midnight): a long day may not exceed the base."""
+    captured = {}
+    monkeypatch.setattr(
+        hithink, "_request",
+        lambda path, params=None, *, ttl=None: captured.update(ttl=ttl) or {"item": []},
+    )
+    monkeypatch.setattr(hithink, "seconds_until_local_midnight", lambda now=None: 999_999)
+    hithink.trading_days()
+    assert captured["ttl"] == hithink.TTL_CALENDAR

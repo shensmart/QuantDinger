@@ -45,6 +45,22 @@ SHANGHAI_TZ = timezone(timedelta(hours=8))
 _MARKET_OPEN = (9, 15)
 _MARKET_CLOSE = (15, 30)
 
+
+def seconds_until_local_midnight(now: Optional[datetime] = None) -> int:
+    """Seconds remaining until the next Shanghai midnight (min 1).
+
+    Cache entries that describe *today* must not survive into tomorrow: the
+    trading calendar's date range is extended upstream between sessions, and a
+    stale copy makes ``is_trading_day(today)`` report False on a real trading
+    day.
+    """
+    moment = now or datetime.now(SHANGHAI_TZ)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=SHANGHAI_TZ)
+    moment = moment.astimezone(SHANGHAI_TZ)
+    tomorrow = (moment + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((tomorrow - moment).total_seconds()))
+
 # Endpoint TTLs (seconds).
 TTL_SNAPSHOT = 3
 TTL_VALUATION = 300
@@ -52,6 +68,12 @@ TTL_FINANCIAL = 86_400
 TTL_BOARD_TODAY = 300
 TTL_BOARD_HISTORY = 86_400
 TTL_LADDER = 300
+# The trading calendar is a rolling window that upstream extends as sessions are
+# confirmed.  A fixed 24h TTL meant a copy fetched on the eve of a holiday kept
+# serving its old end-date right through the following session, so
+# ``is_trading_day(today)`` stayed False and the event sync skipped real trading
+# days (observed for 2026-09-28..09-30).  Expiring at local midnight re-reads it
+# once per day, which is exactly when the date range can change.
 TTL_CALENDAR = 86_400
 TTL_DAILY_CLOSED = 21_600
 TTL_DAILY_INTRADAY = 60
@@ -975,8 +997,17 @@ def anomaly_by_stocks(thscodes: Iterable[str]) -> List[dict]:
 
 
 def trading_days() -> List[date]:
-    """Rolling one-year trading calendar, ascending."""
-    data = _request("/api/a-share/calendar/trading-days", {}, ttl=TTL_CALENDAR)
+    """Rolling one-year trading calendar, ascending.
+
+    Cached only until local midnight (see ``seconds_until_local_midnight``):
+    upstream extends the window between sessions, and a copy carried over from
+    before a holiday would otherwise hide the next session.
+    """
+    data = _request(
+        "/api/a-share/calendar/trading-days",
+        {},
+        ttl=min(TTL_CALENDAR, seconds_until_local_midnight()),
+    )
     days: List[date] = []
     for item in _items(data):
         day = parse_trade_date(item.get("date")) or ms_to_date(item.get("date_ms"))
