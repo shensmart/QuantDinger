@@ -16,9 +16,6 @@ import os
 from datetime import date, datetime, time
 
 from app.utils.db import get_db_connection
-from app.utils.logger import get_logger
-
-logger = get_logger(__name__)
 
 
 def _int_env(name: str, default: int) -> int:
@@ -45,28 +42,23 @@ def _quote_window(moment: time) -> bool:
 
 
 def _is_working_day(day: date) -> bool:
-    """Trading-day check that tolerates a stale upstream calendar.
+    """Is this a trading day, per the upstream calendar?
 
-    HiThink serves a rolling one-year calendar that lags the current session, so
-    ``is_trading_day(today)`` is False on a perfectly normal trading morning and
-    the quote refresh would never run. A weekday after the calendar's last entry
-    is therefore provisionally treated as trading; the refresh itself is cheap
-    and the upstream snapshot is the real source of truth.
+    Delegates to ``hithink.is_trading_day`` directly.  An earlier version added
+    a "weekday past the calendar's last entry" fallback, on the theory that
+    HiThink's calendar lagged the current session.  It does not: the stale copy
+    was ours, because the calendar cache held a fixed 24h TTL and a copy
+    fetched before a holiday survived into the next session (see
+    ``hithink_finance.seconds_until_local_midnight``).  That is fixed at the
+    source, and the fallback was actively harmful — it treated the National Day
+    break (2026-10-01..07, all weekdays) as tradeable.
+
+    ``is_trading_day`` already degrades to a weekday check when the calendar
+    cannot be *fetched*, which is the outage case this function used to cover.
     """
     from app.data_sources import hithink_finance as hithink
 
-    if hithink.is_trading_day(day):
-        return True
-    if day.weekday() >= 5:
-        return False
-    try:
-        known = hithink.trading_days()
-    except Exception as exc:  # noqa: BLE001 - a calendar outage must not stop the tick
-        logger.warning("Trading calendar unavailable (%s); assuming a weekday is tradeable", exc)
-        return True
-    if not known:
-        return True
-    return day > max(known)
+    return hithink.is_trading_day(day)
 
 
 def last_sector_refresh_day() -> date | None:

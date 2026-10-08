@@ -604,41 +604,51 @@ def test_refresh_rejects_non_materialized_categories():
 # ---------------------------------------------------------------------------
 
 
-def test_schedule_tick_survives_a_stale_upstream_calendar(monkeypatch):
-    """HiThink's calendar lags today, so the tick must not go permanently idle.
+def test_schedule_tick_trusts_the_calendar_and_never_guesses(monkeypatch):
+    """A day the calendar calls closed must stay closed.
 
-    Regression: with ``is_trading_day(today) == False`` the quote refresh never
-    ran, because the upstream rolling calendar ends on the previous session.
+    Regression: the tick used to treat "any weekday past the calendar's last
+    entry" as tradeable, because upstream was assumed to lag.  It does not lag
+    — our cache was stale — and the guess made the National Day break
+    (2026-10-01..07, all weekdays) look tradeable.
     """
     from app.services import symbol_tag_schedule as schedule
 
     tz = dt.timezone(dt.timedelta(hours=8))
-    friday = dt.date(2026, 9, 18)
-    monday_before = dt.date(2026, 9, 14)
+    holiday = dt.date(2026, 10, 1)  # Thursday, National Day
+    saturday = dt.date(2026, 10, 3)
     monkeypatch.setattr(
-        "app.data_sources.hithink_finance.is_trading_day", lambda day: day == monday_before
-    )
-    monkeypatch.setattr(
-        "app.data_sources.hithink_finance.trading_days", lambda: [monday_before]
+        "app.data_sources.hithink_finance.is_trading_day",
+        lambda day: day not in (holiday, saturday),
     )
     monkeypatch.setattr(
         "app.data_sources.hithink_finance.shanghai_now",
-        lambda: dt.datetime(2026, 9, 18, 14, 0, tzinfo=tz),
+        lambda: dt.datetime(2026, 10, 1, 14, 0, tzinfo=tz),
     )
 
-    # A weekday past the calendar's last known entry is provisionally tradeable.
-    assert schedule._is_working_day(friday) is True
-    assert "quote" in schedule.due_categories()
-    # A weekend is still a weekend.
+    assert schedule._is_working_day(holiday) is False
+    assert schedule.due_categories() == []
+    assert schedule.due_categories(dt.datetime(2026, 10, 1, 20, 0, tzinfo=tz)) == []
+
+    # A real trading day still runs.
+    assert schedule.due_categories(dt.datetime(2026, 9, 18, 14, 0, tzinfo=tz)) == ["quote"]
+    # Saturday is closed even inside the quote window's clock time.
+    assert schedule.due_categories(dt.datetime(2026, 10, 3, 14, 0, tzinfo=tz)) == []
+
+
+def test_schedule_survives_a_calendar_outage(monkeypatch):
+    """A fetch failure must not stop the tick — is_trading_day handles that."""
+    from app.data_sources import hithink_finance as hithink
+    from app.services import symbol_tag_schedule as schedule
+
+    def boom(*_a, **_k):
+        raise hithink.HiThinkUnavailable("offline")
+
+    monkeypatch.setattr(hithink, "trading_days", boom)
+    # Thursday falls back to the weekday check inside is_trading_day.
+    assert schedule._is_working_day(dt.date(2026, 9, 17)) is True
+    # Saturday stays closed.
     assert schedule._is_working_day(dt.date(2026, 9, 19)) is False
-    assert schedule.due_categories(dt.datetime(2026, 9, 19, 14, 0, tzinfo=tz)) == []
-
-    monkeypatch.setattr(
-        "app.data_sources.hithink_finance.trading_days",
-        lambda: (_ for _ in ()).throw(RuntimeError("calendar down")),
-    )
-    # A calendar outage must not stop the tick either.
-    assert schedule._is_working_day(friday) is True
 
 
 def test_sector_refresh_runs_once_per_day_after_the_close(monkeypatch):
