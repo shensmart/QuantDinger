@@ -50,6 +50,7 @@ celery_app.conf.update(
         "app.tasks.hithink_events",
         "app.tasks.symbol_tags",
         "app.tasks.chip_sync",
+        "app.tasks.ops_alert",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -64,6 +65,8 @@ celery_app.conf.update(
         "quantdinger.tasks.symbol_tag_tick": {"queue": "maintenance"},
         "quantdinger.tasks.symbol_tag_sync": {"queue": "maintenance"},
         "quantdinger.tasks.chip_sync_tick": {"queue": "maintenance"},
+        "quantdinger.tasks.ops_watchdog_tick": {"queue": "maintenance"},
+        "quantdinger.tasks.ops_test_alert": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
@@ -110,6 +113,12 @@ celery_app.conf.update(
         "chip-distribution-sync": {
             "task": "quantdinger.tasks.chip_sync_tick",
             "schedule": max(3600, int(os.getenv("CHIP_SYNC_INTERVAL_SEC", "86400"))),
+        },
+        # Collector healthcheck. Runs often; ops_alert dedupes so a persistent
+        # problem reminds at most once per OPS_ALERT_REMIND_SEC.
+        "ops-watchdog": {
+            "task": "quantdinger.tasks.ops_watchdog_tick",
+            "schedule": max(300, int(os.getenv("OPS_ALERT_TICK_SEC", "900"))),
         },
     },
 )
