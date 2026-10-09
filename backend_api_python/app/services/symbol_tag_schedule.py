@@ -16,6 +16,7 @@ import os
 from datetime import date, datetime, time
 
 from app.utils.db import get_db_connection
+from app.services.symbol_tags import SECTOR_CATEGORIES
 
 
 def _int_env(name: str, default: int) -> int:
@@ -69,8 +70,9 @@ def last_sector_refresh_day() -> date | None:
             """
             SELECT MAX(updated_at) AS last_at
             FROM qd_symbol_tags
-            WHERE category IN ('industry', 'concept')
-            """
+            WHERE category = ANY(?)
+            """,
+            (list(SECTOR_CATEGORIES),),
         )
         row = cur.fetchone() or {}
         cur.close()
@@ -101,7 +103,7 @@ def due_categories(now=None, *, last_run: date | None = None) -> list[str]:
     reached = moment.time() >= sector_refresh_time()
     seen = last_sector_refresh_day() if last_run is None else last_run
     if reached and seen != today:
-        due.extend(["industry", "concept"])
+        due.extend(SECTOR_CATEGORIES)
     if _quote_window(moment.time()):
         due.append("quote")
     return due

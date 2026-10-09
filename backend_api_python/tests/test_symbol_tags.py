@@ -661,7 +661,7 @@ def test_sector_refresh_runs_once_per_day_after_the_close(monkeypatch):
 
     assert schedule.due_categories(before, last_run=dt.date(2026, 9, 17)) == ["quote"]
     assert schedule.due_categories(after, last_run=dt.date(2026, 9, 17)) == [
-        "industry", "concept", "quote",
+        "industry", "concept", "region", "feature", "quote",
     ]
     # Already synced today -> no second constituent crawl.
     assert schedule.due_categories(after, last_run=dt.date(2026, 9, 18)) == ["quote"]

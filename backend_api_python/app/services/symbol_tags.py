@@ -40,8 +40,9 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-CATEGORIES = ("industry", "concept", "event", "quote")
-MATERIALIZED_CATEGORIES = ("industry", "concept", "quote")
+SECTOR_CATEGORIES = ("industry", "concept", "region", "feature")
+CATEGORIES = (*SECTOR_CATEGORIES, "event", "quote")
+MATERIALIZED_CATEGORIES = (*SECTOR_CATEGORIES, "quote")
 MARKET = "CNStock"
 SOURCE = "hithink_finance"
 
@@ -89,6 +90,20 @@ class SymbolTagError(ValueError):
 def _int_env(name: str, default: int) -> int:
     try:
         return max(1, int(str(os.getenv(name) or "").strip() or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_env_allow_zero(name: str, default: int = 0) -> int:
+    """Like ``_int_env`` but keeps 0 meaningful.
+
+    ``_int_env`` floors at 1, so passing it a 0 default silently turns it into
+    1.  That is right for a tick interval and wrong for a limit, where 0 is the
+    "no limit" sentinel -- ``_refresh_sectors`` did exactly that and synced a
+    single sector per day instead of the whole catalogue.
+    """
+    try:
+        return max(0, int(str(os.getenv(name) or "").strip() or default))
     except (TypeError, ValueError):
         return default
 
@@ -828,7 +843,7 @@ class SymbolTagService:
         if unknown:
             raise SymbolTagError(f"symbolTag.notRefreshable:{','.join(unknown)}")
         report: dict[str, Any] = {"categories": wanted, "warnings": []}
-        sector_categories = [item for item in wanted if item in ("industry", "concept")]
+        sector_categories = [item for item in wanted if item in SECTOR_CATEGORIES]
         if sector_categories:
             report["sectors"] = self._refresh_sectors(sector_categories)
         if "quote" in wanted:
@@ -837,10 +852,12 @@ class SymbolTagService:
 
     @staticmethod
     def _refresh_sectors(categories: list[str]) -> dict:
-        from scripts.sync_ths_sector_tags import sync as sync_sectors
+        from scripts.sync_ths_sector_tags import TAGS, sync as sync_sectors
 
-        tag_names = ["industry" if item == "industry" else "cn_concept" for item in categories]
-        limit = _int_env("SYMBOL_TAG_SECTOR_LIMIT", 0) or None
+        tag_names = [name for name, (_, category, _, _) in TAGS.items() if category in categories]
+        # 0/empty means "every sector"; see _int_env_allow_zero for why this
+        # cannot go through _int_env.
+        limit = _int_env_allow_zero("SYMBOL_TAG_SECTOR_LIMIT", 0) or None
         return sync_sectors(
             tags=tag_names,
             only=[],
@@ -1016,6 +1033,7 @@ def _symbol_names() -> dict[str, str]:
 
 
 def _serialize_tag(row: dict) -> dict:
+    metadata = _json(row.get("metadata_json"), {})
     return {
         "id": int(row.get("id") or 0),
         "code": str(row.get("code") or ""),
@@ -1028,7 +1046,9 @@ def _serialize_tag(row: dict) -> dict:
         "sort_order": int(row.get("sort_order") or 0),
         "point_in_time": bool(row.get("point_in_time")),
         "rule": _json(row.get("rule_json"), {}),
-        "metadata": _json(row.get("metadata_json"), {}),
+        "metadata": metadata,
+        "parent_code": str(metadata.get("parent_code") or ""),
+        "level": int(metadata.get("level") or 1),
         "member_count": int(row.get("member_count") or 0),
         "as_of_date": _iso(row.get("as_of_date")),
         "updated_at": _iso(row.get("updated_at")),
@@ -1077,6 +1097,7 @@ def get_symbol_tag_service() -> SymbolTagService:
 
 
 __all__ = [
+    "SECTOR_CATEGORIES",
     "CATEGORIES",
     "MATERIALIZED_CATEGORIES",
     "SymbolTagError",

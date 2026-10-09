@@ -20,13 +20,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
-
-import requests
 
 ROOT = "/app"
 if ROOT not in sys.path:
@@ -42,7 +39,6 @@ SOURCE = "hithink_finance"
 SOURCE_NAME = "HiThink Financial API"
 SYSTEM_MARKET = "CNStock"
 
-DEFAULT_BASE_URL = "https://fuyao.aicubes.cn"
 CATALOG_PATH = "/api/a-share-index/catalog/ths-index-list"
 CONSTITUENTS_PATH = "/api/a-share-index/constituents/ths-stock-list"
 
@@ -50,12 +46,12 @@ CONSTITUENTS_PATH = "/api/a-share-index/constituents/ths-stock-list"
 TAGS = {
     "industry": ("cn_industry", "industry", "Industry", 0),
     "cn_concept": ("cn_concept", "concept", "Concept", 1000),
+    "region": ("cn_region", "region", "Region", 2000),
+    "tszs": ("cn_feature", "feature", "Feature", 3000),
 }
 
-# Candidate field names for an upstream parent link. The THS catalogue returns
-# only thscode/name today, so the industry tree is derived from member-set
-# inclusion in app/services/tag_hierarchy.py instead; this probe exists only to
-# record the fact, so a future upstream field is noticed rather than guessed at.
+# Log future upstream parent fields. Today industry parents follow catalogue
+# order, with member-set inference retained as a fallback for old snapshots.
 PARENT_FIELDS = ("parent_thscode", "parent_code", "parent", "pid")
 _CODE_RE = re.compile(r"[^a-z0-9]+")
 _THSCODE_RE = re.compile(r"^(\d{6})\.(SH|SZ|BJ)$", re.IGNORECASE)
@@ -65,45 +61,14 @@ class SectorSyncError(RuntimeError):
     pass
 
 
-def _api_key() -> str:
-    value = str(os.getenv("HITHINK_FINANCE_API_KEY") or "").strip()
-    if not value:
-        raise SectorSyncError(
-            "HITHINK_FINANCE_API_KEY is not configured in backend.env"
-        )
-    return value
-
-
-def _base_url() -> str:
-    return (
-        str(os.getenv("HITHINK_FINANCE_BASE_URL") or DEFAULT_BASE_URL)
-        .strip()
-        .rstrip("/")
-    )
-
-
 def _request(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    response = requests.get(
-        f"{_base_url()}{path}",
-        params=params or {},
-        headers={
-            "X-api-key": _api_key(),
-            "Accept": "application/json",
-            "User-Agent": "QuantDinger/4.0",
-        },
-        timeout=45,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if int(payload.get("code") or 0) != 0:
-        raise SectorSyncError(
-            f"{SOURCE_NAME} request failed: {payload.get('code')} "
-            f"{payload.get('message') or 'unknown error'}"
-        )
-    return payload
+    # Share rate limits, retries and response cleanup with the other THS feeds.
+    from app.data_sources.hithink_finance import _request as request
+
+    return {"data": request(path, params)}
 
 
-def fetch_catalog(tag: str) -> list[dict[str, str]]:
+def fetch_catalog(tag: str) -> list[dict[str, Any]]:
     payload = _request(CATALOG_PATH, {"tag": tag})
     items = ((payload.get("data") or {}).get("item") or [])
     if items:
@@ -113,21 +78,41 @@ def fetch_catalog(tag: str) -> list[dict[str, str]]:
             "THS catalogue fields for tag=%s: %s; parent field: %s",
             tag,
             ",".join(present),
-            ",".join(parents) or "none (hierarchy is derived from member overlap)",
+            ",".join(parents) or "none (industry hierarchy uses catalogue order)",
         )
-    output: list[dict[str, str]] = []
+    output: list[dict[str, Any]] = []
+    parent = ""
+    seen: set[str] = set()
     for item in items:
         thscode = str(item.get("thscode") or "").strip().upper()
         name = str(item.get("name") or "").strip()
         if not thscode or not name:
-            continue
-        output.append({"thscode": thscode, "name": name})
-    return sorted(output, key=lambda item: (item["name"], item["thscode"]))
+            raise SectorSyncError(f"invalid catalogue entry for {tag}")
+        if thscode in seen:
+            raise SectorSyncError(f"duplicate catalogue code: {thscode}")
+        seen.add(thscode)
+        metadata = {"level": 1, "parent_code": ""}
+        if tag == "industry":
+            if re.fullmatch(r"881\d{3}\.TI", thscode):
+                parent = _tag_code(TAGS[tag][0], thscode)
+            elif re.fullmatch(r"884\d{3}\.TI", thscode) and parent:
+                metadata.update(level=2, parent_code=parent)
+            else:
+                raise SectorSyncError(f"unrecognised industry catalogue order: {thscode}")
+            # ponytail: verified catalogue order, not an explicit upstream parent
+            # contract; use upstream parent fields when the provider exposes them.
+            metadata["hierarchy_source"] = "catalogue_order"
+        output.append({"thscode": thscode, "name": name, "metadata": metadata})
+    if not output:
+        raise SectorSyncError(f"empty catalogue for {tag}")
+    return output
 
 
 def fetch_constituents(thscode: str) -> list[dict[str, Any]]:
     payload = _request(CONSTITUENTS_PATH, {"thscode": thscode})
-    items = ((payload.get("data") or {}).get("item") or [])
+    items = (payload.get("data") or {}).get("item")
+    if not isinstance(items, list):
+        raise SectorSyncError(f"invalid constituent response for {thscode}")
     output: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in items:
@@ -156,6 +141,8 @@ def fetch_constituents(thscode: str) -> list[dict[str, Any]]:
                 "source_ticker": ticker,
             },
         })
+    if items and not output:
+        raise SectorSyncError(f"no valid constituents in response for {thscode}")
     return output
 
 
@@ -196,6 +183,7 @@ def upsert_tag(
     display_name: str,
     members: list[dict[str, Any]],
     as_of: date,
+    hierarchy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prefix, category, label, order = TAGS[tag]
     code = _tag_code(prefix, thscode)
@@ -209,6 +197,7 @@ def upsert_tag(
         "snapshot_as_of": as_of.isoformat(),
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "member_count": len(members),
+        **(hierarchy or {}),
     }
     with get_db_connection() as db:
         cur = db.cursor()
@@ -260,7 +249,7 @@ def _selected_sectors(
     *,
     only: Iterable[str],
     limit: int | None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     catalog = fetch_catalog(tag)
     wanted = {str(item).strip().upper() for item in only if str(item).strip()}
     if wanted:
@@ -298,7 +287,8 @@ def sync(
             name = sector["name"]
             try:
                 members = fetch_constituents(thscode)
-                if not members:
+                # Dynamic specialty boards can legitimately have no stocks today.
+                if not members and tag != "tszs":
                     raise SectorSyncError("empty constituent list")
                 if dry_run:
                     results.append({
@@ -314,6 +304,7 @@ def sync(
                         display_name=name,
                         members=members,
                         as_of=as_of,
+                        hierarchy=sector["metadata"],
                     ))
                 if index % 25 == 0:
                     logger.info("%s sync progress: %s/%s", tag, index, len(sectors))
@@ -338,13 +329,13 @@ def sync(
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync THS industry/concept tags from HiThink Financial API"
+        description="Sync THS industry/concept/region/feature tags from HiThink Financial API"
     )
     parser.add_argument(
         "--tag",
         action="append",
         choices=sorted(TAGS),
-        help="catalog tag to sync; repeatable (default: industry and cn_concept)",
+        help="catalog tag to sync; repeatable (default: all four catalogues)",
     )
     parser.add_argument(
         "--only",
