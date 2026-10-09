@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
+
+# The ``celery`` console script starts with sys.path[0] set to the bin directory,
+# not the project root, so ``from scripts... import`` (used by the sector-tag
+# refresh and the public-universe snapshots) raised ModuleNotFoundError inside
+# workers while working fine in the API process.  Put the backend root on the
+# path explicitly: celery's own cwd_in_path() only adds it for the duration of
+# an import, and it *removes* it again in a finally block -- so this must not be
+# guarded on membership, or the removal would win and the fix would be a no-op.
+_BACKEND_ROOT = str(Path(__file__).resolve().parents[1])
+sys.path.insert(0, _BACKEND_ROOT)
 
 from celery import Celery, Task
 from app.config.redis_urls import celery_broker_url, celery_result_backend_url

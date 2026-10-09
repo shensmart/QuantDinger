@@ -40,7 +40,14 @@ def chip_sync_tick(job_id: int = 0):
             except ValueError:
                 return {"skipped": "no symbols"}
 
-    result = run_batch(target, _batch_size())
+    # Stop the batch well before the 600s soft limit: hitting it SIGKILLs the
+    # worker, and the item in flight plus the self-rescheduled drain are lost.
+    try:
+        deadline = max(60.0, float(os.getenv("CHIP_SYNC_DEADLINE_SEC", "480")))
+    except (TypeError, ValueError):
+        deadline = 480.0
+
+    result = run_batch(target, _batch_size(), max_seconds=deadline)
     result["job_id"] = target
     status = job_status(target) or {}
     result["job_status"] = status.get("status")

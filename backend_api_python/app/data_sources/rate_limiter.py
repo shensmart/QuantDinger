@@ -328,6 +328,7 @@ def install_http_throttle() -> bool:
         return True
 
     last_log = {"at": 0.0}
+    default_timeout = _throttle_env_float("AKSHARE_HTTP_TIMEOUT_SEC", 30.0)
 
     def throttled_send(self, request, **kwargs):
         host = ""
@@ -336,6 +337,13 @@ def install_http_throttle() -> bool:
         except Exception:
             host = ""
         slept = _throttle_wait(host)
+        # AkShare passes no timeout, so a stalled upstream holds the worker
+        # until celery's time limit SIGKILLs it.  Only the hosts this patch
+        # already owns get the default: install_http_throttle runs in every
+        # process role, and a read timeout on, say, a streaming LLM call would
+        # be a new bug rather than a fix.
+        if default_timeout > 0 and _host_budget(host) is not None:
+            kwargs.setdefault("timeout", default_timeout)
         if slept >= 1.0:
             now = time.time()
             if now - last_log["at"] >= _THROTTLE_LOG_INTERVAL:

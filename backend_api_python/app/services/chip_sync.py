@@ -19,6 +19,7 @@ Design
 from __future__ import annotations
 
 import os
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -41,6 +42,10 @@ DEFAULT_BATCH_SIZE = int(os.getenv("CHIP_SYNC_BATCH_SIZE", "50") or 50)
 MAX_ATTEMPTS = int(os.getenv("CHIP_SYNC_MAX_ATTEMPTS", "3") or 3)
 # Backoff before a retryable symbol is tried again.
 RETRY_BACKOFF_SEC = int(os.getenv("CHIP_SYNC_RETRY_BACKOFF_SEC", "300") or 300)
+# A ``running`` item older than this belongs to a worker that was hard-killed
+# (celery's time limit SIGKILLs the pool child, so no except/finally can run).
+# Such items are never re-claimed and would wedge the job forever.
+STALE_RUNNING_SEC = int(os.getenv("CHIP_SYNC_STALE_RUNNING_SEC", "1800") or 1800)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -354,8 +359,42 @@ def finish_item(
     )
 
 
-def run_batch(job_id: int, batch_size: int = DEFAULT_BATCH_SIZE) -> Dict[str, int]:
-    """Process up to ``batch_size`` symbols for a job.  Never raises per symbol."""
+def reclaim_stale_items(job_id: int) -> int:
+    """Return hard-killed ``running`` items to ``pending``.  Returns how many.
+
+    The celery time limit kills the pool child with SIGKILL, so the item it was
+    holding keeps ``status='running'`` and ``claim_item`` (which only looks at
+    ``pending``) never picks it up again.  One such row is enough to keep a job
+    at ``running`` forever, which also stops the drain loop from finishing.
+    """
+    row = _query(
+        "UPDATE qd_chip_sync_items SET status = 'pending', retry_at = NOW(), "
+        "updated_at = NOW() "
+        "WHERE job_id = %s AND status = 'running' "
+        "AND updated_at < NOW() - (%s * INTERVAL '1 second') "
+        "RETURNING id",
+        (job_id, STALE_RUNNING_SEC),
+        many=True,
+    ) or []
+    count = len(row)
+    if count:
+        logger.warning(
+            "Chip sync reclaimed %d stale running item(s) for job %s", count, job_id
+        )
+    return count
+
+
+def run_batch(
+    job_id: int, batch_size: int = DEFAULT_BATCH_SIZE, max_seconds: float = 0
+) -> Dict[str, int]:
+    """Process up to ``batch_size`` symbols for a job.  Never raises per symbol.
+
+    ``max_seconds`` stops the batch between symbols so a slow upstream cannot
+    push the task into celery's time limit, which SIGKILLs the child and loses
+    the drain chain entirely (the item in flight is reclaimed on the next run).
+    """
+    reclaimed = reclaim_stale_items(job_id)
+    started = time.time()
     lookback = int(
         _row_get(
             _query("SELECT lookback_days FROM qd_chip_sync_jobs WHERE id = %s", (job_id,)),
@@ -367,6 +406,12 @@ def run_batch(job_id: int, batch_size: int = DEFAULT_BATCH_SIZE) -> Dict[str, in
     processed = succeeded = failed = rows_total = 0
 
     for _ in range(max(1, batch_size)):
+        if max_seconds and processed and time.time() - started >= max_seconds:
+            logger.info(
+                "Chip sync job %s stopped at %d symbols after %.0fs (deadline)",
+                job_id, processed, time.time() - started,
+            )
+            break
         item = claim_item(job_id)
         if item is None:
             break
@@ -399,6 +444,8 @@ def run_batch(job_id: int, batch_size: int = DEFAULT_BATCH_SIZE) -> Dict[str, in
         "succeeded": succeeded,
         "failed": failed,
         "rows_written": rows_total,
+        "reclaimed": reclaimed,
+        "elapsed_s": round(time.time() - started, 1),
     }
 
 
