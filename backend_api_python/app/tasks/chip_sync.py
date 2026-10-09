@@ -16,6 +16,18 @@ def _batch_size() -> int:
         return 50
 
 
+def _defer_seconds() -> float:
+    """How long to wait before retrying after a full upstream budget.
+
+    The trailing-hour window is what refills, so a few minutes is enough to
+    make progress again without hammering the host.
+    """
+    try:
+        return max(30.0, float(os.getenv("CHIP_SYNC_DEFER_SEC", "300")))
+    except (TypeError, ValueError):
+        return 300.0
+
+
 @celery_app.task(name="quantdinger.tasks.chip_sync_tick", soft_time_limit=600, time_limit=660)
 def chip_sync_tick(job_id: int = 0):
     from app.data_sources.rate_limiter import install_http_throttle
@@ -54,7 +66,13 @@ def chip_sync_tick(job_id: int = 0):
     result["symbols_done"] = status.get("symbols_done")
     result["symbols_total"] = status.get("symbols_total")
 
-    # Keep draining while work remains.
-    if status.get("status") != "complete" and result.get("processed"):
-        chip_sync_tick.apply_async(kwargs={"job_id": target}, countdown=2)
+    # Keep draining while work remains.  A deferred batch means upstream's
+    # budget is full, so resume after it refills instead of immediately -- a
+    # countdown of 2s here would just re-wait and re-defer in a loop.
+    if status.get("status") != "complete" and (
+        result.get("processed") or result.get("deferred")
+    ):
+        countdown = _defer_seconds() if result.get("deferred") else 2
+        chip_sync_tick.apply_async(kwargs={"job_id": target}, countdown=countdown)
+        result["next_run_in_s"] = countdown
     return result

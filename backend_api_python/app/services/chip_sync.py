@@ -23,6 +23,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from app.data_sources.rate_limiter import ThrottleBudgetExhausted
 from app.services.chip_distribution import compute_series
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -384,6 +385,21 @@ def reclaim_stale_items(job_id: int) -> int:
     return count
 
 
+def release_item(item_id: int, reason: str) -> None:
+    """Put a claimed item straight back without consuming a retry.
+
+    Used when nothing was attempted -- most importantly when a host's hourly
+    budget is full.  The claim incremented ``attempts``, so it is undone here;
+    otherwise a throttled batch would burn the retry allowance of every symbol
+    it touched and fail them permanently without ever calling upstream.
+    """
+    _query(
+        "UPDATE qd_chip_sync_items SET status = 'pending', attempts = GREATEST(attempts - 1, 0), "
+        "retry_at = NOW(), updated_at = NOW(), error = %s WHERE id = %s",
+        ((reason or "")[:300], item_id),
+    )
+
+
 def run_batch(
     job_id: int, batch_size: int = DEFAULT_BATCH_SIZE, max_seconds: float = 0
 ) -> Dict[str, int]:
@@ -392,6 +408,10 @@ def run_batch(
     ``max_seconds`` stops the batch between symbols so a slow upstream cannot
     push the task into celery's time limit, which SIGKILLs the child and loses
     the drain chain entirely (the item in flight is reclaimed on the next run).
+
+    A full upstream budget ends the batch early via ``deferred``: the remaining
+    symbols are simply not attempted yet, and the caller reschedules once the
+    trailing-hour window refills.
     """
     reclaimed = reclaim_stale_items(job_id)
     started = time.time()
@@ -404,6 +424,7 @@ def run_batch(
         or DEFAULT_LOOKBACK_DAYS
     )
     processed = succeeded = failed = rows_total = 0
+    deferred = False
 
     for _ in range(max(1, batch_size)):
         if max_seconds and processed and time.time() - started >= max_seconds:
@@ -421,6 +442,17 @@ def run_batch(
             finish_item(item["id"], written)
             succeeded += 1
             rows_total += written
+        except ThrottleBudgetExhausted as exc:
+            # Nothing was fetched: hand the symbol back unretried and stop the
+            # batch so the rest of the queue is not drained into the same wall.
+            release_item(item["id"], "deferred: %s" % exc)
+            processed -= 1
+            deferred = True
+            logger.warning(
+                "Chip sync job %s deferred at %s (%d done): %s",
+                job_id, item["symbol"], succeeded, exc,
+            )
+            break
         except Exception as exc:
             # Delisted/suspended symbols raise ValueError; those never succeed,
             # so don't burn retries on them.
@@ -445,6 +477,7 @@ def run_batch(
         "failed": failed,
         "rows_written": rows_total,
         "reclaimed": reclaimed,
+        "deferred": deferred,
         "elapsed_s": round(time.time() - started, 1),
     }
 

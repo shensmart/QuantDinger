@@ -224,6 +224,16 @@ _DEFAULT_THROTTLE: Dict[str, Tuple[float, int]] = {
 }
 
 _THROTTLE_LOG_INTERVAL = 60.0
+# Hard ceiling on time spent waiting for a host's budget inside one request.
+# Without it the loop below re-sleeps until the trailing-hour window frees a
+# slot, parking the caller for up to an hour -- which is how a chip batch came
+# to sit at "processed: 1" until celery's time limit killed it.
+#
+# Exceeding the cap raises ThrottleBudgetExhausted instead of sending anyway:
+# blowing the hourly budget is what gets this deployment's egress blocked in
+# the first place, so the correct response to a full budget is to stop and let
+# the caller resume later, not to spend the budget twice as fast.
+_THROTTLE_MAX_WAIT_SEC = 60.0
 _throttle_lock = threading.Lock()
 _throttle_states: Dict[str, dict] = {}
 _throttle_installed = False
@@ -261,10 +271,29 @@ def _host_budget(host: str) -> Optional[Tuple[float, int]]:
     return None
 
 
+class ThrottleBudgetExhausted(RuntimeError):
+    """Raised when a host's hourly budget is full and waiting is not allowed.
+
+    A control-flow signal, not a data error: the caller should stop the current
+    batch and resume later (the budget refills as the trailing hour rolls), and
+    must not count this against the item's retry allowance -- nothing was
+    attempted.
+    """
+
+
+def _throttle_max_wait() -> float:
+    """Ceiling for one request's throttle wait; the operator's tuning knob."""
+    return _throttle_env_float("AKSHARE_THROTTLE_MAX_WAIT_SEC", _THROTTLE_MAX_WAIT_SEC)
+
+
 def _throttle_wait(host: str) -> float:
     """Sleep as required to respect this host's interval and hourly budget.
 
     Returns the slept duration.  Caller must hold no lock.
+
+    Raises ``ThrottleBudgetExhausted`` when the wait would exceed
+    ``AKSHARE_THROTTLE_MAX_WAIT_SEC``; the request must then be abandoned
+    rather than sent early (see ``_THROTTLE_MAX_WAIT_SEC``).
     """
     enabled, scale = throttle_settings()
     if not enabled:
@@ -277,6 +306,7 @@ def _throttle_wait(host: str) -> float:
     if min_interval <= 0 and hourly <= 0:
         return 0.0
 
+    cap = _throttle_max_wait()
     slept = 0.0
     while True:
         with _throttle_lock:
@@ -300,6 +330,18 @@ def _throttle_wait(host: str) -> float:
                     state["last"] = now
                     state["stamps"].append(now)
                     return slept
+        if cap > 0 and slept + wait > cap:
+            logger.warning(
+                "Throttle budget for %s exhausted (%s/h) after waiting %.0fs; "
+                "deferring the request.  Raise AKSHARE_THROTTLE_MAX_WAIT_SEC to "
+                "wait longer, or AKSHARE_THROTTLE_SCALE to stretch the intervals.",
+                host,
+                hourly,
+                slept,
+            )
+            raise ThrottleBudgetExhausted(
+                "hourly budget for %s exhausted (%s/h)" % (host, hourly)
+            )
         time.sleep(wait)
         slept += wait
 
